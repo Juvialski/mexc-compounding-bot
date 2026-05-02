@@ -2,24 +2,24 @@ const ccxt = require('ccxt');
 const express = require('express');
 const { ATR, SMA } = require('technicalindicators');
 
-// 1. KEEP-ALIVE SERVER
+// --- 1. KEEP-ALIVE SERVER ---
 const app = express();
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 10000; // Updated to match your log port
 app.get('/', (req, res) => res.send('BTC Sniper Bot is LIVE and Compounding!'));
 app.listen(port, () => console.log(`Monitor active on port ${port}`));
 
-// 2. MEXC CONNECTION
+// --- 2. MEXC CONNECTION ---
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
     options: { 'defaultType': 'swap' }
 });
 
-// 3. BOT SETTINGS
+// --- 3. BOT SETTINGS ---
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.10;        
-const trailPercent = 0.005;     
+const riskFactor = 0.10;        // Uses 10% of total balance per trade
+const trailPercent = 0.005;     // 0.5% Trailing Stop
 const obiThreshold = 0.70;      
 
 let isPositionOpen = false;
@@ -53,6 +53,7 @@ async function runBot() {
             if (currentPrice <= stopLossPrice) {
                 console.log(`>>> CLOSING POSITION at ${currentPrice} (Trailing Stop Triggered) <<<`);
                 
+                // Live Exit Order
                 await mexc.createLimitSellOrder(symbol, currentQty, currentPrice);
                 
                 isPositionOpen = false;
@@ -67,8 +68,11 @@ async function runBot() {
             const positionValue = usdtBalance * riskFactor * leverage;
             const btcQty = (positionValue / currentPrice).toFixed(3);
 
+            if (parseFloat(btcQty) <= 0) return; // Prevent errors on tiny balances
+
             console.log(`>>> SNIPING LONG: ${btcQty} BTC at ${currentPrice} <<<`);
             
+            // Live Entry Order
             await mexc.createLimitBuyOrder(symbol, btcQty, currentPrice);
             
             entryPrice = currentPrice;
@@ -82,14 +86,21 @@ async function runBot() {
     }
 }
 
-// 4. STARTUP SEQUENCE
+// --- 4. FIXED STARTUP SEQUENCE ---
 console.log("Initializing Bot for LIVE Trading...");
-mexc.setLeverage(leverage, symbol)
-    .then(() => {
+
+async function startBot() {
+    try {
+        // MEXC requires leverage to be set for both Long (1) and Short (2) sides in Isolated mode (1)
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
+        
         console.log(`SUCCESS: Leverage set to ${leverage}x. Starting Sniper Loop...`);
         setInterval(runBot, 10000); 
-    })
-    .catch((error) => {
-        console.error("FATAL STARTUP ERROR");
+    } catch (error) {
+        console.error("!!! FATAL STARTUP ERROR !!!");
         console.error("REASON:", error.message);
-    });
+    }
+}
+
+startBot();
