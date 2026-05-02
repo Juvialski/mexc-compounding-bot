@@ -8,8 +8,8 @@ app.listen(process.env.PORT || 3000);
 
 // 2. MEXC CONNECTION
 const mexc = new ccxt.mexc({
-    apiKey: 'YOUR_API_KEY',
-    secret: 'YOUR_SECRET_KEY',
+    apiKey: process.env.API_KEY,
+    secret: process.env.API_SECRET,
     options: { 'defaultType': 'swap' }
 });
 
