@@ -17,9 +17,12 @@ const symbol = 'BTC/USDT:USDT';
 const leverage = 10;
 const riskFactor = 0.20; 
 const obiThreshold = 0.70; 
-const historyLimit = 5;        
+const historyLimit = 5;         
 let obiHistory = [];
 let isTrading = false;
+
+// State tracking for Trailing Stop
+let peakPrice = 0; 
 
 async function getMarketContext() {
     const ohlcv1h = await mexc.fetchOHLCV(symbol, '1h', undefined, 50);
@@ -58,7 +61,6 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
-        // OBI Calculation
         const orderbook = await mexc.fetchOrderBook(symbol, 10);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -67,24 +69,60 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        // UPDATED LOG LINE: Swapped ₱ for $
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${usdtBalance.toFixed(2)} | OBI: ${avgObi.toFixed(2)} | RSI: ${ctx.rsi.toFixed(1)}`);
 
-        // EXIT LOGIC
+        // EXIT LOGIC WITH PROTECTIVE BREAK-EVEN & TRAILING STOP
         if (longPos) {
             const entryPrice = parseFloat(longPos.entryPrice);
-            const stopLoss = entryPrice - (ctx.atr * 2); 
+            
+            // Track the highest price seen during this trade
+            if (peakPrice === 0 || ctx.currentPrice > peakPrice) {
+                peakPrice = ctx.currentPrice;
+            }
+
+            // 1. Initial Stop Loss (2x ATR)
+            let stopLoss = entryPrice - (ctx.atr * 2);
+
+            // 2. Break-Even Trigger: If price moves up 1% or 1.5x ATR, move SL to Entry
+            if (ctx.currentPrice > entryPrice + (ctx.atr * 1.5)) {
+                stopLoss = Math.max(stopLoss, entryPrice);
+            }
+
+            // 3. Trailing Stop: Keep SL 1.5% behind the peak price reached
+            const trailingStop = peakPrice * 0.985;
+            stopLoss = Math.max(stopLoss, trailingStop);
+
             if (ctx.currentPrice < stopLoss || ctx.rsi > 85) {
-                console.log(`>>> EXITING LONG. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
+                console.log(`>>> EXITING LONG. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)} | Peak: ${peakPrice.toFixed(2)}`);
                 await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                peakPrice = 0; // Reset tracking
             }
         }
+
         if (shortPos) {
             const entryPrice = parseFloat(shortPos.entryPrice);
-            const stopLoss = entryPrice + (ctx.atr * 2); 
+            
+            // Track the lowest price seen during this trade
+            if (peakPrice === 0 || ctx.currentPrice < peakPrice) {
+                peakPrice = ctx.currentPrice;
+            }
+
+            // 1. Initial Stop Loss (2x ATR)
+            let stopLoss = entryPrice + (ctx.atr * 2);
+
+            // 2. Break-Even Trigger
+            if (ctx.currentPrice < entryPrice - (ctx.atr * 1.5)) {
+                stopLoss = Math.min(stopLoss, entryPrice);
+            }
+
+            // 3. Trailing Stop: Keep SL 1.5% ahead of the lowest price reached
+            const trailingStop = peakPrice * 1.015;
+            stopLoss = Math.min(stopLoss, trailingStop);
+
             if (ctx.currentPrice > stopLoss || ctx.rsi < 15) {
-                console.log(`>>> EXITING SHORT. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
+                console.log(`>>> EXITING SHORT. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)} | Low: ${peakPrice.toFixed(2)}`);
                 await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                peakPrice = 0; // Reset tracking
             }
         }
 
@@ -99,11 +137,13 @@ async function runBot() {
                 console.log(`>>> SNIPING LONG: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 obiHistory = [];
+                peakPrice = ctx.currentPrice; 
             } 
             else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 35) {
                 console.log(`>>> SNIPING SHORT: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 obiHistory = [];
+                peakPrice = ctx.currentPrice;
             }
         }
     } catch (e) {
