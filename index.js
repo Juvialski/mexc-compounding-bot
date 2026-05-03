@@ -58,6 +58,7 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
+        // OBI Calculation
         const orderbook = await mexc.fetchOrderBook(symbol, 10);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -66,8 +67,10 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Bal: $\$${usdtBalance.toFixed(2)}$ | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
+        // FIXED LOG LINE: Now includes Price, Balance, ADX, OBV, and OBI correctly
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: ₱${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
 
+        // EXIT LOGIC
         if (longPos) {
             const entryPrice = parseFloat(longPos.entryPrice);
             const stopLoss = entryPrice - (ctx.atr * 2); 
@@ -85,6 +88,7 @@ async function runBot() {
             }
         }
 
+        // ENTRY LOGIC
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
