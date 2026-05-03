@@ -67,8 +67,8 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        // FIXED LOG LINE: Now includes Price, Balance, ADX, OBV, and OBI correctly
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: ₱${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
+        // UPDATED LOG LINE: Swapped ₱ for $
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
 
         // EXIT LOGIC
         if (longPos) {
