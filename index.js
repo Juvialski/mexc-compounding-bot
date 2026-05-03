@@ -1,10 +1,10 @@
 const ccxt = require('ccxt');
 const express = require('express');
-const { RSI, SMA, ATR } = require('technicalindicators');
+const { RSI, SMA, ATR, ADX, OBV } = require('technicalindicators');
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Pro-Sniper Bot: Operational'));
+app.get('/', (req, res) => res.send('Elite Sniper Bot: Operational'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
@@ -16,9 +16,9 @@ const mexc = new ccxt.mexc({
 // --- SETTINGS ---
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.05;      // Use 5% of balance per trade
-const obiThreshold = 0.65;    // Order book imbalance sensitivity
-const historyLimit = 5;       // OBI smoothing
+const riskFactor = 0.05;      // 5% of balance per trade
+const obiThreshold = 0.70;    // Higher sensitivity for "Elite" signals
+const historyLimit = 5;       
 let obiHistory = [];
 
 // --- DYNAMIC STATE ---
@@ -26,51 +26,69 @@ let contractSize = 1;
 let isTrading = false;
 
 /**
- * Fetch Market Context (The "Pro" Logic)
+ * Fetch Institutional Market Context
  */
 async function getMarketContext() {
-    // Fetch 1h candles for Trend, 15m for Momentum
+    // 1h candles for Trend, 15m for execution
     const ohlcv1h = await mexc.fetchOHLCV(symbol, '1h', undefined, 50);
     const ohlcv15m = await mexc.fetchOHLCV(symbol, '15m', undefined, 50);
 
     const closes1h = ohlcv1h.map(c => c[4]);
     const closes15m = ohlcv15m.map(c => c[4]);
-    const highs = ohlcv15m.map(c => c[2]);
-    const lows = ohlcv15m.map(c => c[3]);
+    const highs15m = ohlcv15m.map(c => c[2]);
+    const lows15m = ohlcv15m.map(c => c[3]);
+    const volumes15m = ohlcv15m.map(c => c[5]);
 
-    // 1. Trend Filter (SMA 20)
+    // 1. Trend Filter (1h SMA 20)
     const smaValue = SMA.calculate({ period: 20, values: closes1h }).pop();
-    const currentPrice = closes1h[closes1h.length - 1];
+    const currentPrice = closes15m[closes15m.length - 1];
     const trend = currentPrice > smaValue ? 'BULLISH' : 'BEARISH';
 
-    // 2. Momentum (RSI 14)
+    // 2. Trend Strength (ADX 14) -> Must be > 25 for strong move
+    const adxData = ADX.calculate({
+        high: highs15m,
+        low: lows15m,
+        close: closes15m,
+        period: 14
+    }).pop();
+    const trendStrength = adxData ? adxData.adx : 0;
+
+    // 3. Momentum (RSI 14)
     const rsiValue = RSI.calculate({ period: 14, values: closes15m }).pop();
 
-    // 3. Volatility (ATR for dynamic stops)
-    const atrValue = ATR.calculate({ period: 14, high: highs, low: lows, close: closes15m }).pop();
+    // 4. Volume Confirmation (OBV) -> Checking if OBV is higher than 3 candles ago
+    const obvValues = OBV.calculate({ close: closes15m, volume: volumes15m });
+    const currentObv = obvValues[obvValues.length - 1];
+    const prevObv = obvValues[obvValues.length - 4];
+    const isVolumeConfirming = trend === 'BULLISH' ? currentObv > prevObv : currentObv < prevObv;
 
-    // 4. Support/Resistance (Last 24 bars)
-    const support = Math.min(...lows.slice(-24));
-    const resistance = Math.max(...highs.slice(-24));
+    // 5. Volatility for Stop Loss (ATR 14)
+    const atrValue = ATR.calculate({ period: 14, high: highs15m, low: lows15m, close: closes15m }).pop();
 
-    return { trend, rsi: rsiValue, atr: atrValue, support, resistance, currentPrice };
+    return { 
+        trend, 
+        trendStrength, 
+        rsi: rsiValue, 
+        atr: atrValue, 
+        isVolumeConfirming,
+        currentPrice 
+    };
 }
 
 async function runBot() {
-    if (isTrading) return; // Prevent overlapping loops
+    if (isTrading) return; 
     isTrading = true;
 
     try {
-        const context = await getMarketContext();
+        const ctx = await getMarketContext();
         const positions = await mexc.fetchPositions([symbol]);
-        
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
         const balance = await mexc.fetchBalance();
         const usdtBalance = balance.total['USDT'] || 0;
 
-        // --- ORDER BOOK IMBALANCE CALCULATION ---
+        // Order Book Imbalance Calculation
         const orderbook = await mexc.fetchOrderBook(symbol, 10);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -80,50 +98,47 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[${new Date().toISOString().split('T')[1].split('.')[0]}] Price: ${context.currentPrice} | Trend: ${context.trend} | RSI: ${context.rsi.toFixed(2)} | OBI: ${avgObi.toFixed(2)}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV OK: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
 
-        // --- EXIT LOGIC (ATR-BASED TRAILING STOP) ---
-        // If Long: Exit if price drops below (Current Price - 1.5 * ATR)
+        // --- ELITE EXIT LOGIC (ATR & RSI EXHAUSTION) ---
         if (longPos) {
-            const stopLevel = context.currentPrice - (context.atr * 1.5);
-            if (context.currentPrice < stopLevel || context.rsi > 80) {
-                console.log(">>> CLOSING LONG (Stop Hit or RSI Overbought)");
+            const stopLoss = ctx.currentPrice - (ctx.atr * 2); 
+            if (ctx.currentPrice < stopLoss || ctx.rsi > 85) {
+                console.log(">>> INSTITUTIONAL EXIT: Closing Long");
                 await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1 });
             }
         }
-
-        // If Short: Exit if price rises above (Current Price + 1.5 * ATR)
         if (shortPos) {
-            const stopLevel = context.currentPrice + (context.atr * 1.5);
-            if (context.currentPrice > stopLevel || context.rsi < 20) {
-                console.log(">>> CLOSING SHORT (Stop Hit or RSI Oversold)");
+            const stopLoss = ctx.currentPrice + (ctx.atr * 2);
+            if (ctx.currentPrice > stopLoss || ctx.rsi < 15) {
+                console.log(">>> INSTITUTIONAL EXIT: Closing Short");
                 await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2 });
             }
         }
 
-        // --- ENTRY LOGIC (THE SNIPE) ---
+        // --- ELITE ENTRY LOGIC (THE GOLDEN SETUP) ---
         const buyingPower = usdtBalance * riskFactor * leverage;
-        const contractsToTrade = Math.floor((buyingPower / context.currentPrice) / contractSize) * contractSize;
+        const contractsToTrade = Math.floor((buyingPower / ctx.currentPrice) / contractSize) * contractSize;
 
         if (contractsToTrade > 0 && !longPos && !shortPos) {
             
-            // LONG CRITERIA: Trend is Bullish + OBI is positive + RSI is not overbought
-            if (context.trend === 'BULLISH' && avgObi > obiThreshold && context.rsi < 60) {
-                console.log(`>>> SNIPING LONG: ${contractsToTrade} units`);
+            // LONG: Bullish Trend + Strong ADX + Whale Volume + Positive OBI
+            if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 65) {
+                console.log(`>>> ELITE LONG SIGNAL CONFIRMED: Sniping ${contractsToTrade} units`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1 });
                 obiHistory = [];
             } 
             
-            // SHORT CRITERIA: Trend is Bearish + OBI is negative + RSI is not oversold
-            else if (context.trend === 'BEARISH' && avgObi < -obiThreshold && context.rsi > 40) {
-                console.log(`>>> SNIPING SHORT: ${contractsToTrade} units`);
+            // SHORT: Bearish Trend + Strong ADX + Whale Volume + Negative OBI
+            else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 35) {
+                console.log(`>>> ELITE SHORT SIGNAL CONFIRMED: Sniping ${contractsToTrade} units`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2 });
                 obiHistory = [];
             }
         }
 
     } catch (e) {
-        console.error("Loop Error:", e.message);
+        console.error("Critical Loop Error:", e.message);
     } finally {
         isTrading = false;
     }
@@ -131,19 +146,11 @@ async function runBot() {
 
 async function startBot() {
     try {
-        console.log("Initializing Markets...");
         const markets = await mexc.loadMarkets();
         contractSize = markets[symbol].contractSize;
-        
-        // Ensure Leverage is set correctly
-        try {
-            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
-            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
-        } catch (e) { console.log("Leverage Note:", e.message); }
-
-        console.log(`SUCCESS: Pro-Sniper Bot Active on ${symbol}`);
-        
-        // Check every 10 seconds
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
+        console.log(`ELITE SNIPER DEPLOYED: Listening for institutional patterns on ${symbol}...`);
         setInterval(runBot, 10000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
