@@ -3,7 +3,7 @@ const express = require('express');
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Multi-Sniper: Dual Direction (Long/Short) Pattern Mode'));
+app.get('/', (req, res) => res.send('Multi-Sniper: PnL Tracking Active'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
@@ -39,11 +39,14 @@ async function runBot() {
         const ticker = await mexc.fetchTicker(symbol);
         const currentPrice = ticker.last;
 
+        let activePnl = 0;
+
         if (!longPos) {
             isLongOpen = false;
             highestPriceSeen = 0;
         } else {
             isLongOpen = true;
+            activePnl = longPos.unrealizedPnl || 0;
             if (currentPrice > highestPriceSeen) highestPriceSeen = currentPrice;
         }
 
@@ -52,6 +55,7 @@ async function runBot() {
             lowestPriceSeen = Infinity;
         } else {
             isShortOpen = true;
+            activePnl = shortPos.unrealizedPnl || 0;
             if (currentPrice < lowestPriceSeen) lowestPriceSeen = currentPrice;
         }
 
@@ -68,7 +72,8 @@ async function runBot() {
         
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${currentPrice} | Avg OBI: ${avgObi.toFixed(2)} | Bal: $${usdtBalance.toFixed(2)} | Longs: ${longPos ? longPos.contracts : 0} | Shorts: ${shortPos ? shortPos.contracts : 0}`);
+        // The log now includes the active PnL
+        console.log(`[LOG] Price: ${currentPrice} | Avg OBI: ${avgObi.toFixed(2)} | Bal: $${usdtBalance.toFixed(2)} | Longs: ${longPos ? longPos.contracts : 0} | Shorts: ${shortPos ? shortPos.contracts : 0} | PnL: $${activePnl.toFixed(4)}`);
 
         if (isLongOpen && longPos) {
             const stopLossLong = highestPriceSeen * (1 - trailPercent);
@@ -140,7 +145,7 @@ async function startBot() {
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
         } catch (e) { console.log("Leverage Setup Note:", e.message); }
 
-        console.log(`SUCCESS: Dual-Direction (Long/Short) Pattern Sniper Active.`);
+        console.log(`SUCCESS: Dual-Direction Pattern Sniper with PnL Tracking Active.`);
         setInterval(runBot, 10000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
