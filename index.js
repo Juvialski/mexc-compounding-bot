@@ -15,9 +15,9 @@ const mexc = new ccxt.mexc({
 
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.20; // 20% of $50 = $10 margin.
+const riskFactor = 0.20; 
 const obiThreshold = 0.70; 
-const historyLimit = 5;       
+const historyLimit = 5;        
 let obiHistory = [];
 let isTrading = false;
 
@@ -58,7 +58,6 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
-        // OBI Calculation
         const orderbook = await mexc.fetchOrderBook(symbol, 10);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -67,15 +66,14 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Bal: $${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
+        console.log(`[LOG] Bal: $\$${usdtBalance.toFixed(2)}$ | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
 
-        // --- FIXED EXIT LOGIC (Based on Entry Price) ---
         if (longPos) {
             const entryPrice = parseFloat(longPos.entryPrice);
             const stopLoss = entryPrice - (ctx.atr * 2); 
             if (ctx.currentPrice < stopLoss || ctx.rsi > 85) {
                 console.log(`>>> EXITING LONG. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
-                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1 });
+                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
             }
         }
         if (shortPos) {
@@ -83,11 +81,10 @@ async function runBot() {
             const stopLoss = entryPrice + (ctx.atr * 2); 
             if (ctx.currentPrice > stopLoss || ctx.rsi < 15) {
                 console.log(`>>> EXITING SHORT. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
-                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2 });
+                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
             }
         }
 
-        // --- FIXED CONTRACTS CALCULATION (WHOLE NUMBERS) ---
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
@@ -96,12 +93,12 @@ async function runBot() {
         if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 10) {
             if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 65) {
                 console.log(`>>> SNIPING LONG: ${contractsToTrade} Contracts`);
-                await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1 });
+                await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 obiHistory = [];
             } 
             else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 35) {
                 console.log(`>>> SNIPING SHORT: ${contractsToTrade} Contracts`);
-                await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2 });
+                await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 obiHistory = [];
             }
         }
@@ -115,7 +112,10 @@ async function runBot() {
 async function startBot() {
     try {
         await mexc.loadMarkets();
-        try { await mexc.setLeverage(leverage, symbol); } catch (e) {}
+        try { 
+            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
+            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
+        } catch (e) {}
         console.log(`SUCCESS: Elite Compounding Bot Live on ${symbol}`);
         setInterval(runBot, 10000); 
     } catch (error) {
