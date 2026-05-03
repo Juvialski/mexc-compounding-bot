@@ -4,7 +4,7 @@ const { RSI, SMA, ATR, ADX, OBV } = require('technicalindicators');
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Elite Sniper: Integer Precision Fixed'));
+app.get('/', (req, res) => res.send('Elite Sniper: Fixed & Final'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
@@ -15,7 +15,7 @@ const mexc = new ccxt.mexc({
 
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.20; // 20% of balance per trade ($10 for a $50 account)
+const riskFactor = 0.20; // 20% of $50 = $10 margin.
 const obiThreshold = 0.70; 
 const historyLimit = 5;       
 let obiHistory = [];
@@ -58,61 +58,55 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
+        // OBI Calculation
         const orderbook = await mexc.fetchOrderBook(symbol, 10);
-        const currentObi = (orderbook.bids.reduce((a, b) => a + b[1], 0) - orderbook.asks.reduce((a, b) => a + b[1], 0)) / (orderbook.bids.reduce((a, b) => a + b[1], 0) + orderbook.asks.reduce((a, b) => a + b[1], 0));
+        const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
+        const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
+        const currentObi = (sumBids - sumAsks) / (sumBids + sumAsks);
         obiHistory.push(currentObi);
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Bal: $${usdtBalance.toFixed(2)} | Price: ${ctx.currentPrice} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
+        console.log(`[LOG] Bal: $${usdtBalance.toFixed(2)} | ADX: ${ctx.trendStrength.toFixed(1)} | OBV: ${ctx.isVolumeConfirming} | OBI: ${avgObi.toFixed(2)}`);
 
-        // --- EXIT LOGIC ---
+        // --- FIXED EXIT LOGIC (Based on Entry Price) ---
         if (longPos) {
-            if (ctx.currentPrice < (ctx.currentPrice - (ctx.atr * 1.8)) || ctx.rsi > 85) {
-                console.log(">>> CLOSING LONG");
-                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'params': { 'openType': 1, 'positionType': 1 } });
+            const entryPrice = parseFloat(longPos.entryPrice);
+            const stopLoss = entryPrice - (ctx.atr * 2); 
+            if (ctx.currentPrice < stopLoss || ctx.rsi > 85) {
+                console.log(`>>> EXITING LONG. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
+                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1 });
             }
         }
         if (shortPos) {
-            if (ctx.currentPrice > (ctx.currentPrice + (ctx.atr * 1.8)) || ctx.rsi < 15) {
-                console.log(">>> CLOSING SHORT");
-                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'params': { 'openType': 1, 'positionType': 2 } });
+            const entryPrice = parseFloat(shortPos.entryPrice);
+            const stopLoss = entryPrice + (ctx.atr * 2); 
+            if (ctx.currentPrice > stopLoss || ctx.rsi < 15) {
+                console.log(`>>> EXITING SHORT. Price: ${ctx.currentPrice} | SL: ${stopLoss.toFixed(2)}`);
+                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2 });
             }
         }
 
-        // --- FIXED CONTRACT CALCULATION ---
-        const market = mexc.market(symbol);
-        const contractSize = market.contractSize; // Usually 0.0001 for BTC
-        
-        // Calculate how many BTC units we want
+        // --- FIXED CONTRACTS CALCULATION (WHOLE NUMBERS) ---
+        const market = await mexc.market(symbol);
+        const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
-        
-        // Convert BTC units into WHOLE contracts
-        // Formula: Contracts = BTC_Amount / Contract_Size
         let contractsToTrade = Math.floor(btcToTrade / contractSize);
 
-        // Ensure we trade at least 1 contract if we have enough money
-        if (contractsToTrade < 1 && usdtBalance > 10) contractsToTrade = 1;
-
-        if (contractsToTrade >= 1 && !longPos && !shortPos) {
-            const params = { 'openType': 1 };
-            
+        if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 10) {
             if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 65) {
                 console.log(`>>> SNIPING LONG: ${contractsToTrade} Contracts`);
-                params['positionType'] = 1;
-                await mexc.createMarketBuyOrder(symbol, contractsToTrade, params);
+                await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1 });
                 obiHistory = [];
             } 
             else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 35) {
                 console.log(`>>> SNIPING SHORT: ${contractsToTrade} Contracts`);
-                params['positionType'] = 2;
-                await mexc.createMarketSellOrder(symbol, contractsToTrade, params);
+                await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2 });
                 obiHistory = [];
             }
         }
-
     } catch (e) {
-        console.error("Order Error:", e.message);
+        console.error("Loop Error:", e.message);
     } finally {
         isTrading = false;
     }
@@ -122,11 +116,10 @@ async function startBot() {
     try {
         await mexc.loadMarkets();
         try { await mexc.setLeverage(leverage, symbol); } catch (e) {}
-        console.log(`FIXED ELITE SNIPER: Trading in Whole Contracts on ${symbol}`);
+        console.log(`SUCCESS: Elite Compounding Bot Live on ${symbol}`);
         setInterval(runBot, 10000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
     }
 }
-
 startBot();
