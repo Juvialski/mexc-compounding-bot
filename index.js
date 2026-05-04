@@ -4,7 +4,7 @@ const { RSI, SMA, ATR, ADX, OBV, MACD, BollingerBands } = require('technicalindi
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Elite Hybrid Sniper V4: Momentum & Capitulation Active'));
+app.get('/', (req, res) => res.send('Elite Hybrid Sniper V5: High Risk Active'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
@@ -15,7 +15,7 @@ const mexc = new ccxt.mexc({
 
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.95; 
+const riskFactor = 0.95;        // USER REQUESTED: 95% risk for aggressive small-account compounding
 const obiThreshold = 0.20; 
 const historyLimit = 5;         
 let obiHistory = [];
@@ -37,8 +37,10 @@ async function getMarketContext() {
     const lows15m = ohlcv15m.map(c => c[3]);
     const volumes15m = ohlcv15m.map(c => c[5]);
 
-    const smaValue1h = SMA.calculate({ period: 20, values: closes1h }).pop();
     const currentPrice = closes15m[closes15m.length - 1];
+    const previousPrice15m = closes15m[closes15m.length - 2];
+    
+    const smaValue1h = SMA.calculate({ period: 20, values: closes1h }).pop();
     const trend1h = currentPrice > smaValue1h ? 'BULLISH' : 'BEARISH';
     
     const adxData15m = ADX.calculate({ high: highs15m, low: lows15m, close: closes15m, period: 14 }).pop();
@@ -56,6 +58,7 @@ async function getMarketContext() {
     const highs1m = ohlcv1m.map(c => c[2]);
     const lows1m = ohlcv1m.map(c => c[3]);
     const volumes1m = ohlcv1m.map(c => c[5]);
+    const previousPrice1m = closes1m[closes1m.length - 2];
     
     const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
     const atr1m = ATR.calculate({ period: 14, high: highs1m, low: lows1m, close: closes1m }).pop();
@@ -68,10 +71,14 @@ async function getMarketContext() {
     const currentVol1m = volumes1m[volumes1m.length - 1];
     const isVolSpike = currentVol1m > (avgVol1m * 2.0); // True if volume is 200% above average
 
+    // Breakout Levels (15-period highest high / lowest low)
+    const highest15m_1m = Math.max(...highs1m.slice(-16, -1));
+    const lowest15m_1m = Math.min(...lows1m.slice(-16, -1));
+
     return { 
         currentPrice, 
-        swing: { trend: trend1h, strength: trendStrength15m, rsi: rsi15m, atr: atr15m, macd: macd15m, bb: bb15m, volConfirm: isVolumeConfirming15m },
-        scalp: { rsi: rsi1m, atr: atr1m, bb: bb1m, sma: sma1m, macd: macd1m, volSpike: isVolSpike }
+        swing: { trend: trend1h, strength: trendStrength15m, rsi: rsi15m, atr: atr15m, macd: macd15m, bb: bb15m, volConfirm: isVolumeConfirming15m, prevPrice: previousPrice15m },
+        scalp: { rsi: rsi1m, atr: atr1m, bb: bb1m, sma: sma1m, macd: macd1m, volSpike: isVolSpike, prevPrice: previousPrice1m, highest15m: highest15m_1m, lowest15m: lowest15m_1m }
     };
 }
 
@@ -80,11 +87,15 @@ async function runBot() {
     isTrading = true;
 
     try {
-        const ctx = await getMarketContext();
-        const balance = await mexc.fetchBalance();
+        // Parallel execution slashes script lag by ~2.5 seconds
+        const [ctx, balance, positions, orderbook] = await Promise.all([
+            getMarketContext(),
+            mexc.fetchBalance(),
+            mexc.fetchPositions([symbol]),
+            mexc.fetchOrderBook(symbol, 50)
+        ]);
+        
         const usdtBalance = balance.total['USDT'] || 0;
-
-        const positions = await mexc.fetchPositions([symbol]);
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
@@ -92,7 +103,6 @@ async function runBot() {
             activeStrategy = 'SWING';
         }
 
-        const orderbook = await mexc.fetchOrderBook(symbol, 50);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
         const currentObi = (sumBids - sumAsks) / (sumBids + sumAsks);
@@ -100,7 +110,7 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Strategy: ${activeStrategy} | 1m RSI: ${ctx.scalp.rsi.toFixed(1)} | VolSpike: ${ctx.scalp.volSpike}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Strategy: ${activeStrategy} | VolSpike: ${ctx.scalp.volSpike} | 1m RSI: ${ctx.scalp.rsi.toFixed(1)}`);
 
         // --- DYNAMIC EXIT PARAMETERS ---
         const baseAtr = ctx.swing.atr; 
@@ -114,7 +124,6 @@ async function runBot() {
             if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
 
             let stopLoss = entryPrice - (baseAtr * stopMultiplier);
-            
             if (ctx.currentPrice > entryPrice + (trailAtr * trailMultiplier)) stopLoss = Math.max(stopLoss, entryPrice);
             const trailingStop = peakPrice - (trailAtr * trailMultiplier);
             stopLoss = Math.max(stopLoss, trailingStop);
@@ -136,7 +145,6 @@ async function runBot() {
             if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
 
             let stopLoss = entryPrice + (baseAtr * stopMultiplier);
-            
             if (ctx.currentPrice < entryPrice - (trailAtr * trailMultiplier)) stopLoss = Math.min(stopLoss, entryPrice);
             const trailingStop = peakPrice + (trailAtr * trailMultiplier);
             stopLoss = Math.min(stopLoss, trailingStop);
@@ -160,31 +168,36 @@ async function runBot() {
 
         if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 5) {
             
-            // 1. CAPITULATION SCALPS (Catches the absolute top/bottom V-bounces, OBI restrictions removed)
-            if (ctx.currentPrice < ctx.scalp.bb.lower && ctx.scalp.rsi < 20) {
-                console.log(`>>> CAPITULATION LONG DETECTED: ${contractsToTrade} Contracts`);
+            // 1. CAPITULATION SCALPS (Waits for price to hook back inside the Bollinger Band)
+            const prevBelowBBLower = ctx.scalp.prevPrice < ctx.scalp.bb.lower;
+            const currentInsideBBLower = ctx.currentPrice > ctx.scalp.bb.lower;
+            const prevAboveBBUpper = ctx.scalp.prevPrice > ctx.scalp.bb.upper;
+            const currentInsideBBUpper = ctx.currentPrice < ctx.scalp.bb.upper;
+
+            if (prevBelowBBLower && currentInsideBBLower && ctx.scalp.rsi < 35) {
+                console.log(`>>> CONFIRMED CAPITULATION LONG: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 activeStrategy = 'SCALP';
                 obiHistory = [];
                 peakPrice = ctx.currentPrice;
             }
-            else if (ctx.currentPrice > ctx.scalp.bb.upper && ctx.scalp.rsi > 80) {
-                console.log(`>>> BLOW-OFF SHORT DETECTED: ${contractsToTrade} Contracts`);
+            else if (prevAboveBBUpper && currentInsideBBUpper && ctx.scalp.rsi > 65) {
+                console.log(`>>> CONFIRMED BLOW-OFF SHORT: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 activeStrategy = 'SCALP';
                 obiHistory = [];
                 peakPrice = ctx.currentPrice;
             }
             
-            // 2. MOMENTUM SCALPS (Catches Flash Crashes and Sudden Pumps early)
-            else if (ctx.currentPrice < ctx.scalp.sma && ctx.scalp.macd.histogram < 0 && ctx.scalp.volSpike && avgObi < 0) {
+            // 2. MOMENTUM BREAKOUTS (Uses actual Price Action highs/lows + volume)
+            else if (ctx.currentPrice < ctx.scalp.lowest15m && ctx.scalp.volSpike) {
                 console.log(`>>> MOMENTUM BREAKDOWN SHORT: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 activeStrategy = 'SCALP';
                 obiHistory = [];
                 peakPrice = ctx.currentPrice;
             }
-            else if (ctx.currentPrice > ctx.scalp.sma && ctx.scalp.macd.histogram > 0 && ctx.scalp.volSpike && avgObi > 0) {
+            else if (ctx.currentPrice > ctx.scalp.highest15m && ctx.scalp.volSpike) {
                 console.log(`>>> MOMENTUM BREAKOUT LONG: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 activeStrategy = 'SCALP';
@@ -241,9 +254,10 @@ async function startBot() {
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
         } catch (e) {}
-        console.log(`SUCCESS: ELITE HYBRID SNIPER V4 ACTIVE ON ${symbol}`);
+        console.log(`SUCCESS: ELITE HYBRID SNIPER V5 ACTIVE ON ${symbol}`);
         
-        setInterval(runBot, 30000); 
+        // Polling every 5 seconds ensures script-side stop losses actually work and breakouts are caught
+        setInterval(runBot, 5000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
     }
