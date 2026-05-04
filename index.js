@@ -15,15 +15,14 @@ const mexc = new ccxt.mexc({
 
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
-const riskFactor = 0.95; // Keeping 95% Full Power Mode per request
-const obiThreshold = 0.20; // FIXED: Lowered for realistic crypto orderbooks
+const riskFactor = 0.95; 
+const obiThreshold = 0.20; 
 const historyLimit = 5;         
 let obiHistory = [];
 let isTrading = false;
 let peakPrice = 0; 
 
 async function getMarketContext() {
-    // Fetching 50 candles to ensure indicators have enough data to calculate
     const ohlcv1h = await mexc.fetchOHLCV(symbol, '1h', undefined, 50);
     const ohlcv15m = await mexc.fetchOHLCV(symbol, '15m', undefined, 50);
     
@@ -65,7 +64,6 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
-        // IMPROVEMENT: Fetching deeper orderbook (50 levels) to avoid spoofing fakeouts
         const orderbook = await mexc.fetchOrderBook(symbol, 50);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -81,19 +79,16 @@ async function runBot() {
             const entryPrice = parseFloat(longPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
 
-            // Base Stop Loss (2 ATR)
             let stopLoss = entryPrice - (ctx.atr * 2);
             
-            // Move Stop Loss to Break-Even if profit exceeds 1.5 ATR
             if (ctx.currentPrice > entryPrice + (ctx.atr * 1.5)) stopLoss = Math.max(stopLoss, entryPrice);
             
-            // IMPROVEMENT: Dynamic ATR Trailing Stop instead of fixed percentage
             const trailingStop = peakPrice - (ctx.atr * 1.5);
             stopLoss = Math.max(stopLoss, trailingStop);
 
             if (ctx.currentPrice < stopLoss || ctx.rsi > 85) {
                 console.log(`>>> FULL EXIT LONG. Exit Price: ${ctx.currentPrice} | Final SL/Trailing: ${stopLoss.toFixed(2)}`);
-                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'reduceOnly': true });
                 peakPrice = 0;
             }
         }
@@ -103,19 +98,16 @@ async function runBot() {
             const entryPrice = parseFloat(shortPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
 
-            // Base Stop Loss (2 ATR)
             let stopLoss = entryPrice + (ctx.atr * 2);
             
-            // Move Stop Loss to Break-Even if profit exceeds 1.5 ATR
             if (ctx.currentPrice < entryPrice - (ctx.atr * 1.5)) stopLoss = Math.min(stopLoss, entryPrice);
             
-            // IMPROVEMENT: Dynamic ATR Trailing Stop instead of fixed percentage
             const trailingStop = peakPrice + (ctx.atr * 1.5);
             stopLoss = Math.min(stopLoss, trailingStop);
 
             if (ctx.currentPrice > stopLoss || ctx.rsi < 15) {
                 console.log(`>>> FULL EXIT SHORT. Exit Price: ${ctx.currentPrice} | Final SL/Trailing: ${stopLoss.toFixed(2)}`);
-                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'reduceOnly': true });
                 peakPrice = 0;
             }
         }
@@ -127,7 +119,6 @@ async function runBot() {
         let contractsToTrade = Math.floor(btcToTrade / contractSize);
 
         if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 5) {
-            // FIXED: Relaxed RSI to < 80 for longs, > 20 for shorts to catch momentum
             if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 80) {
                 console.log(`>>> FULL POWER LONG: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
@@ -152,7 +143,6 @@ async function startBot() {
     try {
         await mexc.loadMarkets();
         try { 
-            // Set leverage for both Long and Short sides
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
         } catch (e) {
@@ -160,7 +150,6 @@ async function startBot() {
         }
         console.log(`SUCCESS: ELITE SNIPER (95% RISK) ACTIVE ON ${symbol}`);
         
-        // IMPROVEMENT: Increased to 30 seconds to avoid MEXC rate-limiting/banning
         setInterval(runBot, 30000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
