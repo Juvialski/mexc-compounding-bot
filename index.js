@@ -4,13 +4,14 @@ const { RSI, SMA, ATR, ADX, OBV, MACD, BollingerBands } = require('technicalindi
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Elite Hybrid Sniper V4.1: Limit Order Entries Active'));
+app.get('/', (req, res) => res.send('Elite Hybrid Sniper V4.2: Rapid Polling Active'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
-    options: { 'defaultType': 'swap' }
+    options: { 'defaultType': 'swap' },
+    enableRateLimit: true // CRITICAL: Protects API key from getting banned at 5s speeds
 });
 
 const symbol = 'BTC/USDT:USDT'; 
@@ -82,13 +83,12 @@ async function runBot() {
         const openOrders = await mexc.fetchOpenOrders(symbol);
         
         // --- LIMIT ORDER SAFETY NET ---
-        // If an entry limit order didn't fill in the last 30 seconds, cancel it so we don't double-order
         if (openOrders.length > 0) {
             console.log(`[LOG] Unfilled Limit Orders detected. Canceling to refresh state...`);
             for (let order of openOrders) {
                 try { await mexc.cancelOrder(order.id, symbol); } catch(e) {}
             }
-            return; // Exit this loop to let balances reset before trying again
+            return; 
         }
 
         const ctx = await getMarketContext();
@@ -103,10 +103,9 @@ async function runBot() {
             activeStrategy = 'SWING';
         }
 
-        // Fetch deep orderbook for accurate Maker Limit Pricing
         const orderbook = await mexc.fetchOrderBook(symbol, 50);
-        const bestBid = orderbook.bids[0][0]; // Top of the buy book
-        const bestAsk = orderbook.asks[0][0]; // Bottom of the sell book
+        const bestBid = orderbook.bids[0][0]; 
+        const bestAsk = orderbook.asks[0][0]; 
         
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
@@ -123,7 +122,7 @@ async function runBot() {
         const trailMultiplier = activeStrategy === 'SCALP' ? 1.0 : 1.5; 
         const stopMultiplier = 2.0; 
 
-        // --- LONG POSITION MANAGEMENT (EXITS REMAIN MARKET FOR SAFETY) ---
+        // --- LONG POSITION MANAGEMENT ---
         if (longPos) {
             const entryPrice = parseFloat(longPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
@@ -145,7 +144,7 @@ async function runBot() {
             }
         }
 
-        // --- SHORT POSITION MANAGEMENT (EXITS REMAIN MARKET FOR SAFETY) ---
+        // --- SHORT POSITION MANAGEMENT ---
         if (shortPos) {
             const entryPrice = parseFloat(shortPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
@@ -167,7 +166,7 @@ async function runBot() {
             }
         }
 
-        // --- ENTRY LOGIC (NOW USING LIMIT MAKER ORDERS) ---
+        // --- ENTRY LOGIC ---
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
@@ -177,14 +176,14 @@ async function runBot() {
             
             // 1. CAPITULATION SCALPS 
             if (ctx.currentPrice < ctx.scalp.bb.lower && ctx.scalp.rsi < 20) {
-                console.log(`>>> CAPITULATION LONG LIMIT DETECTED: ${contractsToTrade} Contracts at ${bestBid}`);
+                console.log(`>>> CAPITULATION LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
                 await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 activeStrategy = 'SCALP';
                 obiHistory = [];
                 peakPrice = ctx.currentPrice;
             }
             else if (ctx.currentPrice > ctx.scalp.bb.upper && ctx.scalp.rsi > 80) {
-                console.log(`>>> BLOW-OFF SHORT LIMIT DETECTED: ${contractsToTrade} Contracts at ${bestAsk}`);
+                console.log(`>>> BLOW-OFF SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
                 await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 activeStrategy = 'SCALP';
                 obiHistory = [];
@@ -256,9 +255,10 @@ async function startBot() {
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
         } catch (e) {}
-        console.log(`SUCCESS: ELITE HYBRID SNIPER V4.1 (LIMIT ENTRIES) ACTIVE ON ${symbol}`);
+        console.log(`SUCCESS: ELITE HYBRID SNIPER V4.2 (5s RAPID POLLING) ACTIVE ON ${symbol}`);
         
-        setInterval(runBot, 30000); 
+        // CRITICAL: Interval changed from 30000 to 5000 (5 seconds)
+        setInterval(runBot, 5000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
     }
