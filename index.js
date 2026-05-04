@@ -16,7 +16,7 @@ const mexc = new ccxt.mexc({
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
 const riskFactor = 0.95; // Keeping 95% Full Power Mode per request
-const obiThreshold = 0.70; 
+const obiThreshold = 0.20; // FIXED: Lowered for realistic crypto orderbooks
 const historyLimit = 5;         
 let obiHistory = [];
 let isTrading = false;
@@ -127,13 +127,14 @@ async function runBot() {
         let contractsToTrade = Math.floor(btcToTrade / contractSize);
 
         if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 5) {
-            if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 65) {
+            // FIXED: Relaxed RSI to < 80 for longs, > 20 for shorts to catch momentum
+            if (ctx.trend === 'BULLISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi > obiThreshold && ctx.rsi < 80) {
                 console.log(`>>> FULL POWER LONG: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                 obiHistory = [];
                 peakPrice = ctx.currentPrice; 
             } 
-            else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 35) {
+            else if (ctx.trend === 'BEARISH' && ctx.trendStrength > 25 && ctx.isVolumeConfirming && avgObi < -obiThreshold && ctx.rsi > 20) {
                 console.log(`>>> FULL POWER SHORT: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                 obiHistory = [];
