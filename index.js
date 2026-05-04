@@ -4,14 +4,14 @@ const { RSI, SMA, ATR, ADX, OBV, MACD, BollingerBands } = require('technicalindi
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Elite Hybrid Sniper V4.2: Rapid Polling Active'));
+app.get('/', (req, res) => res.send('Elite Sniper V5: Pure Swing Mode Active'));
 app.listen(port);
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
     options: { 'defaultType': 'swap' },
-    enableRateLimit: true // CRITICAL: Protects API key from getting banned at 5s speeds
+    enableRateLimit: true 
 });
 
 const symbol = 'BTC/USDT:USDT'; 
@@ -22,13 +22,12 @@ const historyLimit = 5;
 let obiHistory = [];
 let isTrading = false;
 let peakPrice = 0; 
-let activeStrategy = 'NONE'; 
 
 async function getMarketContext() {
-    const [ohlcv1h, ohlcv15m, ohlcv1m] = await Promise.all([
+    // Only fetching 1h and 15m now. 1m scalp data is completely removed.
+    const [ohlcv1h, ohlcv15m] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1h', undefined, 50),
-        mexc.fetchOHLCV(symbol, '15m', undefined, 50),
-        mexc.fetchOHLCV(symbol, '1m', undefined, 50)
+        mexc.fetchOHLCV(symbol, '15m', undefined, 50)
     ]);
     
     // --- SWING CONTEXT (15m) ---
@@ -52,26 +51,9 @@ async function getMarketContext() {
     const obvValues15m = OBV.calculate({ close: closes15m, volume: volumes15m });
     const isVolumeConfirming15m = trend1h === 'BULLISH' ? obvValues15m[obvValues15m.length - 1] > obvValues15m[obvValues15m.length - 4] : obvValues15m[obvValues15m.length - 1] < obvValues15m[obvValues15m.length - 4];
 
-    // --- SCALP CONTEXT (1m) ---
-    const closes1m = ohlcv1m.map(c => c[4]);
-    const highs1m = ohlcv1m.map(c => c[2]);
-    const lows1m = ohlcv1m.map(c => c[3]);
-    const volumes1m = ohlcv1m.map(c => c[5]);
-    
-    const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
-    const atr1m = ATR.calculate({ period: 14, high: highs1m, low: lows1m, close: closes1m }).pop();
-    const bb1m = BollingerBands.calculate({ period: 20, values: closes1m, stdDev: 2.5 }).pop(); 
-    const sma1m = SMA.calculate({ period: 20, values: closes1m }).pop();
-    const macd1m = MACD.calculate({ values: closes1m, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false }).pop();
-
-    const avgVol1m = volumes1m.slice(-10, -1).reduce((a, b) => a + b, 0) / 9;
-    const currentVol1m = volumes1m[volumes1m.length - 1];
-    const isVolSpike = currentVol1m > (avgVol1m * 2.0); 
-
     return { 
         currentPrice, 
-        swing: { trend: trend1h, strength: trendStrength15m, rsi: rsi15m, atr: atr15m, macd: macd15m, bb: bb15m, volConfirm: isVolumeConfirming15m },
-        scalp: { rsi: rsi1m, atr: atr1m, bb: bb1m, sma: sma1m, macd: macd1m, volSpike: isVolSpike }
+        swing: { trend: trend1h, strength: trendStrength15m, rsi: rsi15m, atr: atr15m, macd: macd15m, bb: bb15m, volConfirm: isVolumeConfirming15m }
     };
 }
 
@@ -99,10 +81,6 @@ async function runBot() {
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
-        if ((longPos || shortPos) && activeStrategy === 'NONE') {
-            activeStrategy = 'SWING';
-        }
-
         const orderbook = await mexc.fetchOrderBook(symbol, 50);
         const bestBid = orderbook.bids[0][0]; 
         const bestAsk = orderbook.asks[0][0]; 
@@ -114,59 +92,54 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Strategy: ${activeStrategy} | Bid: ${bestBid} | Ask: ${bestAsk}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Mode: PURE SWING | Bid: ${bestBid} | Ask: ${bestAsk}`);
 
-        // --- DYNAMIC EXIT PARAMETERS ---
-        const baseAtr = ctx.swing.atr; 
-        const trailAtr = activeStrategy === 'SCALP' ? ctx.scalp.atr : ctx.swing.atr; 
-        const trailMultiplier = activeStrategy === 'SCALP' ? 1.0 : 1.5; 
-        const stopMultiplier = 2.0; 
+        // --- PURE SWING EXIT PARAMETERS ---
+        const activeAtr = ctx.swing.atr; 
+        const trailMultiplier = 1.5; // Generous trailing room
+        const stopMultiplier = 2.0;  // Hard stop
 
         // --- LONG POSITION MANAGEMENT ---
         if (longPos) {
-            const entryPrice = parseFloat(longPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
+            const entryPrice = parseFloat(longPos.entryPrice);
 
-            let stopLoss = entryPrice - (baseAtr * stopMultiplier);
+            let stopLoss = entryPrice - (activeAtr * stopMultiplier);
             
-            if (ctx.currentPrice > entryPrice + (trailAtr * trailMultiplier)) stopLoss = Math.max(stopLoss, entryPrice);
-            const trailingStop = peakPrice - (trailAtr * trailMultiplier);
+            if (ctx.currentPrice > entryPrice + (activeAtr * trailMultiplier)) stopLoss = Math.max(stopLoss, entryPrice);
+            const trailingStop = peakPrice - (activeAtr * trailMultiplier);
             stopLoss = Math.max(stopLoss, trailingStop);
 
-            const isSwingExit = activeStrategy === 'SWING' && (ctx.swing.rsi > 80 && ctx.swing.macd.histogram < 0);
-            const isScalpExit = activeStrategy === 'SCALP' && ctx.scalp.rsi > 75;
+            const isSwingExit = ctx.swing.rsi > 80 && ctx.swing.macd.histogram < 0;
 
-            if (ctx.currentPrice < stopLoss || isSwingExit || isScalpExit) {
-                console.log(`>>> EXIT LONG (${activeStrategy}). MARKET STOP TRIGGERED. Price: ${ctx.currentPrice}`);
+            if (ctx.currentPrice < stopLoss || isSwingExit) {
+                console.log(`>>> EXIT LONG (SWING). MARKET STOP TRIGGERED. Price: ${ctx.currentPrice}`);
                 await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'reduceOnly': true });
                 peakPrice = 0;
-                activeStrategy = 'NONE';
             }
         }
 
         // --- SHORT POSITION MANAGEMENT ---
         if (shortPos) {
-            const entryPrice = parseFloat(shortPos.entryPrice);
             if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
+            const entryPrice = parseFloat(shortPos.entryPrice);
 
-            let stopLoss = entryPrice + (baseAtr * stopMultiplier);
+            let stopLoss = entryPrice + (activeAtr * stopMultiplier);
             
-            if (ctx.currentPrice < entryPrice - (trailAtr * trailMultiplier)) stopLoss = Math.min(stopLoss, entryPrice);
-            const trailingStop = peakPrice + (trailAtr * trailMultiplier);
+            if (ctx.currentPrice < entryPrice - (activeAtr * trailMultiplier)) stopLoss = Math.min(stopLoss, entryPrice);
+            const trailingStop = peakPrice + (activeAtr * trailMultiplier);
             stopLoss = Math.min(stopLoss, trailingStop);
 
-            const isSwingExit = activeStrategy === 'SWING' && (ctx.swing.rsi < 20 && ctx.swing.macd.histogram > 0);
-            const isScalpExit = activeStrategy === 'SCALP' && ctx.scalp.rsi < 25;
+            const isSwingExit = ctx.swing.rsi < 20 && ctx.swing.macd.histogram > 0;
 
-            if (ctx.currentPrice > stopLoss || isSwingExit || isScalpExit) {
-                console.log(`>>> EXIT SHORT (${activeStrategy}). MARKET STOP TRIGGERED. Price: ${ctx.currentPrice}`);
+            if (ctx.currentPrice > stopLoss || isSwingExit) {
+                console.log(`>>> EXIT SHORT (SWING). MARKET STOP TRIGGERED. Price: ${ctx.currentPrice}`);
                 await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'reduceOnly': true });
                 peakPrice = 0;
-                activeStrategy = 'NONE';
             }
         }
 
-        // --- ENTRY LOGIC ---
+        // --- ENTRY LOGIC (PURE SWING ONLY) ---
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
@@ -174,71 +147,32 @@ async function runBot() {
 
         if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 5) {
             
-            // 1. CAPITULATION SCALPS 
-            if (ctx.currentPrice < ctx.scalp.bb.lower && ctx.scalp.rsi < 20) {
-                console.log(`>>> CAPITULATION LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                activeStrategy = 'SCALP';
-                obiHistory = [];
-                peakPrice = ctx.currentPrice;
-            }
-            else if (ctx.currentPrice > ctx.scalp.bb.upper && ctx.scalp.rsi > 80) {
-                console.log(`>>> BLOW-OFF SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                activeStrategy = 'SCALP';
-                obiHistory = [];
-                peakPrice = ctx.currentPrice;
-            }
-            
-            // 2. MOMENTUM SCALPS 
-            else if (ctx.currentPrice < ctx.scalp.sma && ctx.scalp.macd.histogram < 0 && ctx.scalp.volSpike && avgObi < 0) {
-                console.log(`>>> MOMENTUM BREAKDOWN SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                activeStrategy = 'SCALP';
-                obiHistory = [];
-                peakPrice = ctx.currentPrice;
-            }
-            else if (ctx.currentPrice > ctx.scalp.sma && ctx.scalp.macd.histogram > 0 && ctx.scalp.volSpike && avgObi > 0) {
-                console.log(`>>> MOMENTUM BREAKOUT LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                activeStrategy = 'SCALP';
-                obiHistory = [];
-                peakPrice = ctx.currentPrice;
-            }
-            
-            // 3. SWING LOGIC 
-            else {
-                const isOverextendedLong = ctx.currentPrice >= ctx.swing.bb.upper;
-                const isOverextendedShort = ctx.currentPrice <= ctx.swing.bb.lower;
+            const isOverextendedLong = ctx.currentPrice >= ctx.swing.bb.upper;
+            const isOverextendedShort = ctx.currentPrice <= ctx.swing.bb.lower;
 
-                if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > 70 && ctx.swing.macd.histogram < 0 && avgObi < 0) {
-                    console.log(`>>> SWING REVERSAL SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                    await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                    activeStrategy = 'SWING';
-                    obiHistory = [];
-                    peakPrice = ctx.currentPrice;
-                }
-                else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < 30 && ctx.swing.macd.histogram > 0 && avgObi > 0) {
-                    console.log(`>>> SWING REVERSAL LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                    await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                    activeStrategy = 'SWING';
-                    obiHistory = [];
-                    peakPrice = ctx.currentPrice;
-                }
-                else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > 25 && ctx.swing.volConfirm && avgObi > obiThreshold) {
-                    console.log(`>>> SWING TREND LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                    await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                    activeStrategy = 'SWING';
-                    obiHistory = [];
-                    peakPrice = ctx.currentPrice; 
-                } 
-                else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > 25 && ctx.swing.volConfirm && avgObi < -obiThreshold) {
-                    console.log(`>>> SWING TREND SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                    await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                    activeStrategy = 'SWING';
-                    obiHistory = [];
-                    peakPrice = ctx.currentPrice;
-                }
+            if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > 70 && ctx.swing.macd.histogram < 0 && avgObi < 0) {
+                console.log(`>>> SWING REVERSAL SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
+                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                obiHistory = [];
+                peakPrice = ctx.currentPrice;
+            }
+            else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < 30 && ctx.swing.macd.histogram > 0 && avgObi > 0) {
+                console.log(`>>> SWING REVERSAL LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
+                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                obiHistory = [];
+                peakPrice = ctx.currentPrice;
+            }
+            else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > 25 && ctx.swing.volConfirm && avgObi > obiThreshold) {
+                console.log(`>>> SWING TREND LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
+                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                obiHistory = [];
+                peakPrice = ctx.currentPrice; 
+            } 
+            else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > 25 && ctx.swing.volConfirm && avgObi < -obiThreshold) {
+                console.log(`>>> SWING TREND SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
+                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                obiHistory = [];
+                peakPrice = ctx.currentPrice;
             }
         }
     } catch (e) {
@@ -255,9 +189,9 @@ async function startBot() {
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 }); 
         } catch (e) {}
-        console.log(`SUCCESS: ELITE HYBRID SNIPER V4.2 (5s RAPID POLLING) ACTIVE ON ${symbol}`);
+        console.log(`SUCCESS: ELITE SNIPER V5 (PURE SWING) ACTIVE ON ${symbol}`);
         
-        // CRITICAL: Interval changed from 30000 to 5000 (5 seconds)
+        // Polling every 5s purely for fast Limit entry detection. No scalping allowed.
         setInterval(runBot, 5000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
