@@ -26,6 +26,10 @@ let obiHistory = [];
 let isTrading = false;
 let peakPrice = 0; 
 
+// Global state for Dashboard UI
+let liveUsdtBalance = 0;
+let activePosition = null;
+
 // ==========================================
 // TELEGRAM NOTIFICATIONS
 // ==========================================
@@ -101,17 +105,26 @@ app.get('/', async (req, res) => {
         const totalWins = allTrades.filter(t => t.isWin).length;
         const winRate = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(2) : 0;
         
-        // Sum USD Pnl
         const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0).toFixed(2);
-        
-        // Fetch Live Balance 
-        let liveBalance = 0;
-        try {
-            const balanceData = await mexc.fetchBalance();
-            liveBalance = balanceData.total['USDT'] || 0;
-        } catch (e) {
-            liveBalance = allTrades.length > 0 ? allTrades[0].balanceAfter : 0; // Fallback to last recorded DB balance
-        }
+
+        // HTML block for Active Position
+        const posHtml = activePosition ? `
+            <div class="card active-pos-card">
+                <h2>🟢 Active Position: ${activePosition.side}</h2>
+                <div class="grid">
+                    <div class="stat-row"><span>Entry Price:</span> <strong>$${activePosition.entryPrice.toFixed(2)}</strong></div>
+                    <div class="stat-row"><span>Current Price:</span> <strong>$${activePosition.currentPrice.toFixed(2)}</strong></div>
+                    <div class="stat-row"><span>Size (Contracts):</span> <strong>${activePosition.contracts}</strong></div>
+                    <div class="stat-row"><span>Unrealized Net PnL (USD):</span> <strong class="${activePosition.unrealizedPnlUsd >= 0 ? 'win' : 'loss'}">$${activePosition.unrealizedPnlUsd.toFixed(2)}</strong></div>
+                </div>
+                <p style="font-size: 12px; color: #64748b; margin-top: 10px; margin-bottom: 0;">*Unrealized Net PnL already subtracts estimated exit taker fees.</p>
+            </div>
+        ` : `
+            <div class="card idle-pos-card">
+                <h2>⚪ No Active Position</h2>
+                <p style="color: #94a3b8; margin: 0;">Scanning markets for the next sniper entry...</p>
+            </div>
+        `;
 
         const html = `
             <html>
@@ -121,8 +134,10 @@ app.get('/', async (req, res) => {
                     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0b0f19; color: #e2e8f0; padding: 20px; }
                     .container { max-width: 1050px; margin: auto; }
                     .card { background: #1e293b; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
+                    .active-pos-card { border: 1px solid #0ea5e9; background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%); }
+                    .idle-pos-card { border: 1px dashed #334155; }
                     h1 { color: #38bdf8; text-align: center; border-bottom: 1px solid #334155; padding-bottom: 10px;}
-                    h2 { color: #a78bfa; margin-top: 0; }
+                    h2 { color: #a78bfa; margin-top: 0; margin-bottom: 15px; }
                     table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
                     th, td { border-bottom: 1px solid #334155; padding: 12px; text-align: left; }
                     th { background-color: #0f172a; color: #94a3b8; font-weight: 600;}
@@ -132,15 +147,18 @@ app.get('/', async (req, res) => {
                     .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #334155; padding-bottom: 4px; }
                     .highlight { color: #facc15; font-weight: bold; font-size: 16px; }
                 </style>
-                <meta http-equiv="refresh" content="30">
+                <meta http-equiv="refresh" content="10">
             </head>
             <body>
                 <div class="container">
                     <h1>🎯 Elite Sniper V5: Live Operations</h1>
+                    
+                    ${posHtml}
+
                     <div class="grid">
                         <div class="card">
                             <h2>📊 Performance Stats</h2>
-                            <div class="stat-row"><span>Live Account Balance:</span> <strong class="highlight">$${liveBalance.toFixed(2)}</strong></div>
+                            <div class="stat-row"><span>Live Account Balance:</span> <strong class="highlight">$${liveUsdtBalance.toFixed(2)}</strong></div>
                             <div class="stat-row"><span>Total Trades:</span> <strong>${totalTrades}</strong></div>
                             <div class="stat-row"><span>Win Rate:</span> <strong>${winRate}%</strong></div>
                             <div class="stat-row"><span>Total Net PnL (USD):</span> <strong class="${totalPnlUsd >= 0 ? 'win' : 'loss'}">$${totalPnlUsd}</strong></div>
@@ -224,14 +242,10 @@ async function getMarketContext() {
 // ==========================================
 async function processTradeExit(side, entryPrice, exitPrice, contracts, contractSize) {
     try {
-        // 1. Calculate the USD value of the position
         const positionValueEntry = entryPrice * contracts * contractSize;
         const positionValueExit = exitPrice * contracts * contractSize;
-        
-        // Initial Margin based on Leverage
         const initialMarginUsd = positionValueEntry / leverage;
 
-        // 2. Calculate Raw PnL in USD
         let rawPnlUsd = 0;
         if (side === 'LONG') {
             rawPnlUsd = (exitPrice - entryPrice) * contracts * contractSize;
@@ -239,25 +253,22 @@ async function processTradeExit(side, entryPrice, exitPrice, contracts, contract
             rawPnlUsd = (entryPrice - exitPrice) * contracts * contractSize;
         }
         
-        // 3. Calculate Exact Fees in USD
         const entryFeeUsd = positionValueEntry * takerFeeRate;
         const exitFeeUsd = positionValueExit * takerFeeRate;
         const totalFeeUsd = entryFeeUsd + exitFeeUsd;
         
-        // 4. Calculate True Net PnL
         const netPnlUsd = rawPnlUsd - totalFeeUsd;
         const netPnlPercentage = (netPnlUsd / initialMarginUsd) * 100;
         const isWin = netPnlUsd > 0;
 
-        // 5. Fetch Account Balance After Trade
         const balanceData = await mexc.fetchBalance();
-        const currentUsdtBalance = balanceData.total['USDT'] || 0;
+        liveUsdtBalance = balanceData.total['USDT'] || 0; // Update global state
 
         await Trade.create({ 
             side, entryPrice, exitPrice, 
             pnlPercentage: netPnlPercentage, 
             pnlUsd: netPnlUsd,
-            balanceAfter: currentUsdtBalance,
+            balanceAfter: liveUsdtBalance,
             isWin 
         });
 
@@ -269,9 +280,10 @@ async function processTradeExit(side, entryPrice, exitPrice, contracts, contract
             `Net PnL: $${netPnlUsd.toFixed(2)} (${netPnlPercentage.toFixed(2)}%)\n` +
             `Entry: $${entryPrice}\n` +
             `Exit: $${exitPrice}\n\n` +
-            `💼 Current Balance: $${currentUsdtBalance.toFixed(2)}`
+            `💼 Current Balance: $${liveUsdtBalance.toFixed(2)}`
         );
 
+        activePosition = null; // Clear position on exit
         evolveBot();
     } catch (e) {
         console.error("Error saving trade:", e.message);
@@ -331,17 +343,33 @@ async function runBot() {
             }
         }
 
-        // Fetch Market config to correctly calculate contract sizes for PnL
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize;
 
         const ctx = await getMarketContext();
         const balance = await mexc.fetchBalance();
-        const usdtBalance = balance.total['USDT'] || 0;
+        liveUsdtBalance = balance.total['USDT'] || 0; // Update global state for UI
 
         const positions = await mexc.fetchPositions([symbol]);
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
+
+        // Update Active Position Tracker for Dashboard
+        if (longPos) {
+            const ep = parseFloat(longPos.entryPrice);
+            const cnts = parseFloat(longPos.contracts);
+            const rawUsd = (ctx.currentPrice - ep) * cnts * contractSize;
+            const feeEst = (ep * cnts * contractSize * takerFeeRate) + (ctx.currentPrice * cnts * contractSize * takerFeeRate);
+            activePosition = { side: 'LONG', entryPrice: ep, currentPrice: ctx.currentPrice, contracts: cnts, unrealizedPnlUsd: rawUsd - feeEst };
+        } else if (shortPos) {
+            const ep = parseFloat(shortPos.entryPrice);
+            const cnts = parseFloat(shortPos.contracts);
+            const rawUsd = (ep - ctx.currentPrice) * cnts * contractSize;
+            const feeEst = (ep * cnts * contractSize * takerFeeRate) + (ctx.currentPrice * cnts * contractSize * takerFeeRate);
+            activePosition = { side: 'SHORT', entryPrice: ep, currentPrice: ctx.currentPrice, contracts: cnts, unrealizedPnlUsd: rawUsd - feeEst };
+        } else {
+            activePosition = null;
+        }
 
         const orderbook = await mexc.fetchOrderBook(symbol, 50);
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
@@ -351,7 +379,7 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${usdtBalance.toFixed(2)} | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${liveUsdtBalance.toFixed(2)} | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
 
         const activeAtr = ctx.swing.atr; 
         const trailMult = activeBrain.trailMultiplier;
@@ -400,35 +428,35 @@ async function runBot() {
         }
 
         // --- ENTRY LOGIC (MARKET ORDERS) ---
-        const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
+        const btcToTrade = (liveUsdtBalance * riskFactor * leverage) / ctx.currentPrice;
         let contractsToTrade = Math.floor(btcToTrade / contractSize);
 
-        if (contractsToTrade >= 1 && !longPos && !shortPos && usdtBalance > 5) {
+        if (contractsToTrade >= 1 && !longPos && !shortPos && liveUsdtBalance > 5) {
             const isOverextendedLong = ctx.currentPrice >= ctx.swing.bb.upper;
             const isOverextendedShort = ctx.currentPrice <= ctx.swing.bb.lower;
 
             if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > activeBrain.rsiOverbought && ctx.swing.macd.histogram < 0 && avgObi < 0) {
                 console.log(`>>> SWING REVERSAL SHORT MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
+                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${liveUsdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < activeBrain.rsiOversold && ctx.swing.macd.histogram > 0 && avgObi > 0) {
                 console.log(`>>> SWING REVERSAL LONG MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
+                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${liveUsdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi > obiThreshold) {
                 console.log(`>>> SWING TREND LONG MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
+                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${liveUsdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice; 
             } 
             else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi < -obiThreshold) {
                 console.log(`>>> SWING TREND SHORT MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
+                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${liveUsdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
         }
@@ -449,11 +477,11 @@ async function startBot() {
         
         await loadBotBrain();
 
-        console.log(`✅ SUCCESS: ELITE SNIPER V5 ACTIVE ON ${symbol}`);
-        
         const balanceData = await mexc.fetchBalance();
-        const initialBal = balanceData.total['USDT'] || 0;
-        sendTelegramAlert(`✅ Bot Started: Elite Sniper V5 is active on ${symbol}.\nStarting Balance: $${initialBal.toFixed(2)}\nReady to trade.`);
+        liveUsdtBalance = balanceData.total['USDT'] || 0;
+
+        console.log(`✅ SUCCESS: ELITE SNIPER V5 ACTIVE ON ${symbol}`);
+        sendTelegramAlert(`✅ Bot Started: Elite Sniper V5 is active on ${symbol}.\nStarting Balance: $${liveUsdtBalance.toFixed(2)}\nReady to trade.`);
         
         setInterval(runBot, 5000); 
     } catch (error) {
