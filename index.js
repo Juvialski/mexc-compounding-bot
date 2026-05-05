@@ -282,7 +282,8 @@ async function runBot() {
             for (let order of openOrders) {
                 try { await mexc.cancelOrder(order.id, symbol); } catch(e) {}
             }
-            return; 
+            // We removed the "return;" here so that even if it cancels old stuck limit orders, 
+            // it still proceeds to evaluate market entries immediately in the same cycle.
         }
 
         const ctx = await getMarketContext();
@@ -294,9 +295,6 @@ async function runBot() {
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
         const orderbook = await mexc.fetchOrderBook(symbol, 50);
-        const bestBid = orderbook.bids[0][0]; 
-        const bestAsk = orderbook.asks[0][0]; 
-        
         const sumBids = orderbook.bids.reduce((a, b) => a + b[1], 0);
         const sumAsks = orderbook.asks.reduce((a, b) => a + b[1], 0);
         const currentObi = (sumBids - sumAsks) / (sumBids + sumAsks);
@@ -304,7 +302,6 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        // ---> THIS IS THE LINE I ADDED BACK FOR YOU <---
         console.log(`[LOG] Price: ${ctx.currentPrice} | Brain: AI-ACTIVE | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
 
         const activeAtr = ctx.swing.atr; 
@@ -351,7 +348,7 @@ async function runBot() {
             }
         }
 
-        // --- ENTRY LOGIC (USING AI DNA) ---
+        // --- ENTRY LOGIC (MARKET ORDERS) ---
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
@@ -362,27 +359,27 @@ async function runBot() {
             const isOverextendedShort = ctx.currentPrice <= ctx.swing.bb.lower;
 
             if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > activeBrain.rsiOverbought && ctx.swing.macd.histogram < 0 && avgObi < 0) {
-                console.log(`>>> SWING REVERSAL SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal)\nPrice: $${bestAsk}\nContracts: ${contractsToTrade}`);
+                console.log(`>>> SWING REVERSAL SHORT MARKET: ${contractsToTrade} Contracts`);
+                await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < activeBrain.rsiOversold && ctx.swing.macd.histogram > 0 && avgObi > 0) {
-                console.log(`>>> SWING REVERSAL LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal)\nPrice: $${bestBid}\nContracts: ${contractsToTrade}`);
+                console.log(`>>> SWING REVERSAL LONG MARKET: ${contractsToTrade} Contracts`);
+                await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi > obiThreshold) {
-                console.log(`>>> SWING TREND LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
-                await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend)\nPrice: $${bestBid}\nContracts: ${contractsToTrade}`);
+                console.log(`>>> SWING TREND LONG MARKET: ${contractsToTrade} Contracts`);
+                await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice; 
             } 
             else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi < -obiThreshold) {
-                console.log(`>>> SWING TREND SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
-                await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend)\nPrice: $${bestAsk}\nContracts: ${contractsToTrade}`);
+                console.log(`>>> SWING TREND SHORT MARKET: ${contractsToTrade} Contracts`);
+                await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
         }
