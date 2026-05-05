@@ -5,8 +5,6 @@ const { RSI, SMA, ATR, ADX, OBV, MACD, BollingerBands } = require('technicalindi
 
 const app = express();
 const port = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('Elite Sniper V5: Self-Improving Swing Mode Active'));
-app.listen(port);
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -25,13 +23,28 @@ let isTrading = false;
 let peakPrice = 0; 
 
 // ==========================================
+// TELEGRAM NOTIFICATIONS
+// ==========================================
+async function sendTelegramAlert(message) {
+    const token = process.env.TELEGRAM_TOKEN;
+    const chatId = process.env.TELEGRAM_CHAT_ID;
+    if (!token || !chatId) return; // Skips if not set up yet
+    
+    try {
+        const url = `https://api.telegram.org/bot${token}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(message)}`;
+        await fetch(url); // Built into modern Node.js
+    } catch (err) {
+        console.error("Telegram error:", err.message);
+    }
+}
+
+// ==========================================
 // AI MEMORY & DATABASE SETUP (MONGOOSE)
 // ==========================================
 mongoose.connect(process.env.MONGO_URI)
     .then(() => console.log("✅[DATABASE] AI Memory Connected Successfully!"))
     .catch(err => console.error("❌ [DATABASE ERROR]", err));
 
-// Structure for Bot's DNA (Parameters)
 const BotBrainSchema = new mongoose.Schema({
     trailMultiplier: { type: Number, default: 1.5 },
     stopMultiplier: { type: Number, default: 2.0 },
@@ -41,7 +54,6 @@ const BotBrainSchema = new mongoose.Schema({
 });
 const BotBrain = mongoose.model('BotBrain', BotBrainSchema);
 
-// Structure for Trade History
 const TradeSchema = new mongoose.Schema({
     side: String,
     entryPrice: Number,
@@ -52,16 +64,10 @@ const TradeSchema = new mongoose.Schema({
 });
 const Trade = mongoose.model('Trade', TradeSchema);
 
-// Current Active Parameters
 let activeBrain = {
-    trailMultiplier: 1.5,
-    stopMultiplier: 2.0,
-    minTrendStrength: 25,
-    rsiOverbought: 70,
-    rsiOversold: 30
+    trailMultiplier: 1.5, stopMultiplier: 2.0, minTrendStrength: 25, rsiOverbought: 70, rsiOversold: 30
 };
 
-// Load Brain from Database on Startup
 async function loadBotBrain() {
     try {
         let brain = await BotBrain.findOne();
@@ -75,6 +81,88 @@ async function loadBotBrain() {
         console.error("Error loading brain:", e.message);
     }
 }
+
+// ==========================================
+// LIVE DASHBOARD (EXPRESS UI)
+// ==========================================
+app.get('/', async (req, res) => {
+    try {
+        const allTrades = await Trade.find().sort({ timestamp: -1 });
+        const recentTrades = allTrades.slice(0, 15); 
+        const brain = await BotBrain.findOne() || activeBrain;
+
+        const totalTrades = allTrades.length;
+        const totalWins = allTrades.filter(t => t.isWin).length;
+        const winRate = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(2) : 0;
+        const totalPnl = allTrades.reduce((sum, t) => sum + (t.pnlPercentage || 0), 0).toFixed(2);
+
+        const html = `
+            <html>
+            <head>
+                <title>Elite Sniper V5 - Live Dashboard</title>
+                <style>
+                    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0b0f19; color: #e2e8f0; padding: 20px; }
+                    .container { max-width: 1000px; margin: auto; }
+                    .card { background: #1e293b; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
+                    h1 { color: #38bdf8; text-align: center; border-bottom: 1px solid #334155; padding-bottom: 10px;}
+                    h2 { color: #a78bfa; margin-top: 0; }
+                    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+                    th, td { border-bottom: 1px solid #334155; padding: 12px; text-align: left; }
+                    th { background-color: #0f172a; color: #94a3b8; font-weight: 600;}
+                    .win { color: #22c55e; font-weight: bold; }
+                    .loss { color: #ef4444; font-weight: bold; }
+                    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+                    .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #334155; padding-bottom: 4px; }
+                </style>
+                <meta http-equiv="refresh" content="30">
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🎯 Elite Sniper V5: Live Operations</h1>
+                    <div class="grid">
+                        <div class="card">
+                            <h2>📊 Performance Stats</h2>
+                            <div class="stat-row"><span>Total Trades:</span> <strong>${totalTrades}</strong></div>
+                            <div class="stat-row"><span>Win Rate:</span> <strong>${winRate}%</strong></div>
+                            <div class="stat-row"><span>Total PnL:</span> <strong class="${totalPnl >= 0 ? 'win' : 'loss'}">${totalPnl}%</strong></div>
+                            <div class="stat-row"><span>Bot Status:</span> <strong>${isTrading ? "Processing..." : "Scanning Markets..."}</strong></div>
+                        </div>
+                        <div class="card">
+                            <h2>🧬 Current AI DNA</h2>
+                            <div class="stat-row"><span>Trail Multiplier:</span> <strong>${brain.trailMultiplier.toFixed(2)}</strong></div>
+                            <div class="stat-row"><span>Stop Multiplier:</span> <strong>${brain.stopMultiplier.toFixed(2)}</strong></div>
+                            <div class="stat-row"><span>Min Trend Strength:</span> <strong>${brain.minTrendStrength.toFixed(0)}</strong></div>
+                            <div class="stat-row"><span>RSI Overbought:</span> <strong>${brain.rsiOverbought.toFixed(0)}</strong></div>
+                            <div class="stat-row"><span>RSI Oversold:</span> <strong>${brain.rsiOversold.toFixed(0)}</strong></div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h2>📝 Last 15 Trades</h2>
+                        <table>
+                            <tr><th>Date</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Result</th></tr>
+                            ${recentTrades.map(t => `
+                                <tr>
+                                    <td>${new Date(t.timestamp).toLocaleString()}</td>
+                                    <td>${t.side}</td>
+                                    <td>$${t.entryPrice.toFixed(2)}</td>
+                                    <td>$${t.exitPrice.toFixed(2)}</td>
+                                    <td class="${t.isWin ? 'win' : 'loss'}">${t.pnlPercentage.toFixed(2)}%</td>
+                                    <td class="${t.isWin ? 'win' : 'loss'}">${t.isWin ? 'WIN' : 'LOSS'}</td>
+                                </tr>
+                            `).join('')}
+                        </table>
+                    </div>
+                </div>
+            </body>
+            </html>
+        `;
+        res.send(html);
+    } catch (error) {
+        res.status(500).send("Error loading dashboard.");
+    }
+});
+
+app.listen(port, () => console.log(`🌐 Dashboard running on port ${port}`));
 
 // ==========================================
 // CORE TRADING FUNCTIONS
@@ -127,6 +215,9 @@ async function processTradeExit(side, entryPrice, exitPrice) {
 
         await Trade.create({ side, entryPrice, exitPrice, pnlPercentage: pnl, isWin });
         console.log(`💾 [MEMORY] Trade saved. Result: ${isWin ? 'WIN' : 'LOSS'} | PnL: ${pnl.toFixed(2)}%`);
+        
+        // TELEGRAM ALERT FOR TRADE RESULT
+        sendTelegramAlert(`💸 TRADE CLOSED: ${side}\nResult: ${isWin ? 'WIN ✅' : 'LOSS ❌'}\nPnL: ${pnl.toFixed(2)}%\nEntry: $${entryPrice}\nExit: $${exitPrice}`);
 
         evolveBot();
     } catch (e) {
@@ -148,7 +239,6 @@ async function evolveBot() {
         let changed = false;
 
         if (winRate < 0.40) {
-            console.log(`📉 Win rate low. Tightening parameters to protect capital...`);
             brain.minTrendStrength = Math.min(brain.minTrendStrength + 2, 40); 
             brain.stopMultiplier = Math.max(brain.stopMultiplier - 0.2, 1.0);  
             brain.rsiOverbought = Math.min(brain.rsiOverbought + 2, 85);       
@@ -156,18 +246,17 @@ async function evolveBot() {
             changed = true;
         } 
         else if (winRate >= 0.60) {
-            console.log(`📈 Win rate high. Expanding parameters to maximize profits...`);
             brain.trailMultiplier = Math.min(brain.trailMultiplier + 0.1, 3.0); 
             changed = true;
         } 
-        else {
-            console.log(`⚖️ Win rate stable. Maintaining current DNA.`);
-        }
 
         if (changed) {
             await brain.save();
             activeBrain = brain; 
             console.log(`🧬 [NEW DNA EVOLVED]:`, activeBrain);
+            
+            // TELEGRAM ALERT FOR EVOLUTION
+            sendTelegramAlert(`🧬 AI DNA EVOLVED\nRecent Win Rate: ${(winRate * 100).toFixed(0)}%\nNew Stop Multiplier: ${brain.stopMultiplier.toFixed(2)}\nNew Trail Multiplier: ${brain.trailMultiplier.toFixed(2)}\nTrend Strength Reqd: ${brain.minTrendStrength}`);
         }
     } catch (e) {
         console.error("Evolution error:", e.message);
@@ -210,8 +299,6 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Brain: AI-ACTIVE | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
-
         const activeAtr = ctx.swing.atr; 
         const trailMult = activeBrain.trailMultiplier;
         const stopMult = activeBrain.stopMultiplier;
@@ -231,7 +318,6 @@ async function runBot() {
             if (ctx.currentPrice < stopLoss || isSwingExit) {
                 console.log(`>>> EXIT LONG (SWING). MARKET STOP TRIGGERED.`);
                 await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'reduceOnly': true });
-                
                 await processTradeExit('LONG', entryPrice, ctx.currentPrice);
                 peakPrice = 0;
             }
@@ -252,7 +338,6 @@ async function runBot() {
             if (ctx.currentPrice > stopLoss || isSwingExit) {
                 console.log(`>>> EXIT SHORT (SWING). MARKET STOP TRIGGERED.`);
                 await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'reduceOnly': true });
-                
                 await processTradeExit('SHORT', entryPrice, ctx.currentPrice);
                 peakPrice = 0;
             }
@@ -271,21 +356,25 @@ async function runBot() {
             if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > activeBrain.rsiOverbought && ctx.swing.macd.histogram < 0 && avgObi < 0) {
                 console.log(`>>> SWING REVERSAL SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
                 await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal)\nPrice: $${bestAsk}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < activeBrain.rsiOversold && ctx.swing.macd.histogram > 0 && avgObi > 0) {
                 console.log(`>>> SWING REVERSAL LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
                 await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal)\nPrice: $${bestBid}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi > obiThreshold) {
                 console.log(`>>> SWING TREND LONG LIMIT: ${contractsToTrade} Contracts at ${bestBid}`);
                 await mexc.createLimitBuyOrder(symbol, contractsToTrade, bestBid, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend)\nPrice: $${bestBid}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice; 
             } 
             else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi < -obiThreshold) {
                 console.log(`>>> SWING TREND SHORT LIMIT: ${contractsToTrade} Contracts at ${bestAsk}`);
                 await mexc.createLimitSellOrder(symbol, contractsToTrade, bestAsk, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend)\nPrice: $${bestAsk}\nContracts: ${contractsToTrade}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
         }
@@ -306,7 +395,9 @@ async function startBot() {
         
         await loadBotBrain();
 
-        console.log(`✅ SUCCESS: ELITE SNIPER V5 (AI SWING) ACTIVE ON ${symbol}`);
+        console.log(`✅ SUCCESS: ELITE SNIPER V5 ACTIVE ON ${symbol}`);
+        sendTelegramAlert(`✅ Bot Started: Elite Sniper V5 is active on ${symbol}. Ready to trade.`);
+        
         setInterval(runBot, 5000); 
     } catch (error) {
         console.error("STARTUP ERROR:", error.message);
