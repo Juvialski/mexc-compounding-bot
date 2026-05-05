@@ -19,7 +19,7 @@ const mexc = new ccxt.mexc({
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
 const riskFactor = 0.95; 
-const takerFeeRate = 0.0002; 
+const takerFeeRate = 0.0002; // 0.02% MEXC Futures Taker Fee
 const obiThreshold = 0.20; 
 const historyLimit = 5;         
 let obiHistory = [];
@@ -210,13 +210,17 @@ async function processTradeExit(side, entryPrice, exitPrice) {
     try {
         let rawPnl = 0;
         
+        // 1. Calculate Raw PnL
         if (side === 'LONG') {
             rawPnl = ((exitPrice - entryPrice) / entryPrice) * 100 * leverage;
         } else {
             rawPnl = ((entryPrice - exitPrice) / entryPrice) * 100 * leverage;
         }
         
+        // 2. Calculate Exact Fees (Entry + Exit fee, multiplied by leverage)
         const totalFeePercentage = (takerFeeRate * 2) * leverage * 100;
+        
+        // 3. Calculate True Net PnL
         const netPnl = rawPnl - totalFeePercentage;
         const isWin = netPnl > 0;
 
@@ -282,8 +286,6 @@ async function runBot() {
             for (let order of openOrders) {
                 try { await mexc.cancelOrder(order.id, symbol); } catch(e) {}
             }
-            // We removed the "return;" here so that even if it cancels old stuck limit orders, 
-            // it still proceeds to evaluate market entries immediately in the same cycle.
         }
 
         const ctx = await getMarketContext();
