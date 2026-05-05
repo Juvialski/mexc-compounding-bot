@@ -13,12 +13,16 @@ const mexc = new ccxt.mexc({
     enableRateLimit: true 
 });
 
+// ==========================================
+// BOT CONFIGURATION
+// ==========================================
 const symbol = 'BTC/USDT:USDT'; 
 const leverage = 10;
 const riskFactor = 0.95; 
+const takerFeeRate = 0.0002; 
 const obiThreshold = 0.20; 
 const historyLimit = 5;         
-let obiHistory =[];
+let obiHistory = [];
 let isTrading = false;
 let peakPrice = 0; 
 
@@ -28,11 +32,11 @@ let peakPrice = 0;
 async function sendTelegramAlert(message) {
     const token = process.env.TELEGRAM_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
-    if (!token || !chatId) return; // Skips if not set up yet
+    if (!token || !chatId) return; 
     
     try {
         const url = `https://api.telegram.org/bot${token}/sendMessage?chat_id=${chatId}&text=${encodeURIComponent(message)}`;
-        await fetch(url); // Built into modern Node.js
+        await fetch(url); 
     } catch (err) {
         console.error("Telegram error:", err.message);
     }
@@ -42,7 +46,7 @@ async function sendTelegramAlert(message) {
 // AI MEMORY & DATABASE SETUP (MONGOOSE)
 // ==========================================
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => console.log("✅[DATABASE] AI Memory Connected Successfully!"))
+    .then(() => console.log("✅ [DATABASE] AI Memory Connected Successfully!"))
     .catch(err => console.error("❌ [DATABASE ERROR]", err));
 
 const BotBrainSchema = new mongoose.Schema({
@@ -76,7 +80,7 @@ async function loadBotBrain() {
             brain = await BotBrain.create({});
         }
         activeBrain = brain;
-        console.log("🧬[AI DNA LOADED]:", activeBrain);
+        console.log("🧬 [AI DNA LOADED]:", activeBrain);
     } catch (e) {
         console.error("Error loading brain:", e.message);
     }
@@ -121,10 +125,10 @@ app.get('/', async (req, res) => {
                     <h1>🎯 Elite Sniper V5: Live Operations</h1>
                     <div class="grid">
                         <div class="card">
-                            <h2>📊 Performance Stats</h2>
+                            <h2>📊 Performance Stats (Net of Fees)</h2>
                             <div class="stat-row"><span>Total Trades:</span> <strong>${totalTrades}</strong></div>
                             <div class="stat-row"><span>Win Rate:</span> <strong>${winRate}%</strong></div>
-                            <div class="stat-row"><span>Total PnL:</span> <strong class="${totalPnl >= 0 ? 'win' : 'loss'}">${totalPnl}%</strong></div>
+                            <div class="stat-row"><span>Total Net PnL:</span> <strong class="${totalPnl >= 0 ? 'win' : 'loss'}">${totalPnl}%</strong></div>
                             <div class="stat-row"><span>Bot Status:</span> <strong>${isTrading ? "Processing..." : "Scanning Markets..."}</strong></div>
                         </div>
                         <div class="card">
@@ -139,7 +143,7 @@ app.get('/', async (req, res) => {
                     <div class="card">
                         <h2>📝 Last 15 Trades</h2>
                         <table>
-                            <tr><th>Date</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL %</th><th>Result</th></tr>
+                            <tr><th>Date</th><th>Side</th><th>Entry</th><th>Exit</th><th>Net PnL %</th><th>Result</th></tr>
                             ${recentTrades.map(t => `
                                 <tr>
                                     <td>${new Date(t.timestamp).toLocaleString()}</td>
@@ -204,20 +208,22 @@ async function getMarketContext() {
 // ==========================================
 async function processTradeExit(side, entryPrice, exitPrice) {
     try {
-        let pnl = 0;
+        let rawPnl = 0;
+        
         if (side === 'LONG') {
-            pnl = ((exitPrice - entryPrice) / entryPrice) * 100 * leverage;
+            rawPnl = ((exitPrice - entryPrice) / entryPrice) * 100 * leverage;
         } else {
-            pnl = ((entryPrice - exitPrice) / entryPrice) * 100 * leverage;
+            rawPnl = ((entryPrice - exitPrice) / entryPrice) * 100 * leverage;
         }
         
-        const isWin = pnl > 0;
+        const totalFeePercentage = (takerFeeRate * 2) * leverage * 100;
+        const netPnl = rawPnl - totalFeePercentage;
+        const isWin = netPnl > 0;
 
-        await Trade.create({ side, entryPrice, exitPrice, pnlPercentage: pnl, isWin });
-        console.log(`💾 [MEMORY] Trade saved. Result: ${isWin ? 'WIN' : 'LOSS'} | PnL: ${pnl.toFixed(2)}%`);
+        await Trade.create({ side, entryPrice, exitPrice, pnlPercentage: netPnl, isWin });
+        console.log(`💾 [MEMORY] Trade saved. Result: ${isWin ? 'WIN' : 'LOSS'} | Net PnL: ${netPnl.toFixed(2)}%`);
         
-        // TELEGRAM ALERT FOR TRADE RESULT
-        sendTelegramAlert(`💸 TRADE CLOSED: ${side}\nResult: ${isWin ? 'WIN ✅' : 'LOSS ❌'}\nPnL: ${pnl.toFixed(2)}%\nEntry: $${entryPrice}\nExit: $${exitPrice}`);
+        sendTelegramAlert(`💸 TRADE CLOSED: ${side}\nResult: ${isWin ? 'WIN ✅' : 'LOSS ❌'}\nNet PnL (After Fees): ${netPnl.toFixed(2)}%\nEntry: $${entryPrice}\nExit: $${exitPrice}`);
 
         evolveBot();
     } catch (e) {
@@ -255,7 +261,6 @@ async function evolveBot() {
             activeBrain = brain; 
             console.log(`🧬 [NEW DNA EVOLVED]:`, activeBrain);
             
-            // TELEGRAM ALERT FOR EVOLUTION
             sendTelegramAlert(`🧬 AI DNA EVOLVED\nRecent Win Rate: ${(winRate * 100).toFixed(0)}%\nNew Stop Multiplier: ${brain.stopMultiplier.toFixed(2)}\nNew Trail Multiplier: ${brain.trailMultiplier.toFixed(2)}\nTrend Strength Reqd: ${brain.minTrendStrength}`);
         }
     } catch (e) {
@@ -298,6 +303,9 @@ async function runBot() {
         obiHistory.push(currentObi);
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
+
+        // ---> THIS IS THE LINE I ADDED BACK FOR YOU <---
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Brain: AI-ACTIVE | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
 
         const activeAtr = ctx.swing.atr; 
         const trailMult = activeBrain.trailMultiplier;
