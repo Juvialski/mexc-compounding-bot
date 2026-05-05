@@ -63,6 +63,8 @@ const TradeSchema = new mongoose.Schema({
     entryPrice: Number,
     exitPrice: Number,
     pnlPercentage: Number,
+    pnlUsd: { type: Number, default: 0 },
+    balanceAfter: { type: Number, default: 0 },
     isWin: Boolean,
     timestamp: { type: Date, default: Date.now }
 });
@@ -98,7 +100,18 @@ app.get('/', async (req, res) => {
         const totalTrades = allTrades.length;
         const totalWins = allTrades.filter(t => t.isWin).length;
         const winRate = totalTrades > 0 ? ((totalWins / totalTrades) * 100).toFixed(2) : 0;
-        const totalPnl = allTrades.reduce((sum, t) => sum + (t.pnlPercentage || 0), 0).toFixed(2);
+        
+        // Sum USD Pnl
+        const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0).toFixed(2);
+        
+        // Fetch Live Balance 
+        let liveBalance = 0;
+        try {
+            const balanceData = await mexc.fetchBalance();
+            liveBalance = balanceData.total['USDT'] || 0;
+        } catch (e) {
+            liveBalance = allTrades.length > 0 ? allTrades[0].balanceAfter : 0; // Fallback to last recorded DB balance
+        }
 
         const html = `
             <html>
@@ -106,7 +119,7 @@ app.get('/', async (req, res) => {
                 <title>Elite Sniper V5 - Live Dashboard</title>
                 <style>
                     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0b0f19; color: #e2e8f0; padding: 20px; }
-                    .container { max-width: 1000px; margin: auto; }
+                    .container { max-width: 1050px; margin: auto; }
                     .card { background: #1e293b; padding: 20px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.5); }
                     h1 { color: #38bdf8; text-align: center; border-bottom: 1px solid #334155; padding-bottom: 10px;}
                     h2 { color: #a78bfa; margin-top: 0; }
@@ -117,6 +130,7 @@ app.get('/', async (req, res) => {
                     .loss { color: #ef4444; font-weight: bold; }
                     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
                     .stat-row { display: flex; justify-content: space-between; margin-bottom: 8px; border-bottom: 1px dashed #334155; padding-bottom: 4px; }
+                    .highlight { color: #facc15; font-weight: bold; font-size: 16px; }
                 </style>
                 <meta http-equiv="refresh" content="30">
             </head>
@@ -125,10 +139,11 @@ app.get('/', async (req, res) => {
                     <h1>🎯 Elite Sniper V5: Live Operations</h1>
                     <div class="grid">
                         <div class="card">
-                            <h2>📊 Performance Stats (Net of Fees)</h2>
+                            <h2>📊 Performance Stats</h2>
+                            <div class="stat-row"><span>Live Account Balance:</span> <strong class="highlight">$${liveBalance.toFixed(2)}</strong></div>
                             <div class="stat-row"><span>Total Trades:</span> <strong>${totalTrades}</strong></div>
                             <div class="stat-row"><span>Win Rate:</span> <strong>${winRate}%</strong></div>
-                            <div class="stat-row"><span>Total Net PnL:</span> <strong class="${totalPnl >= 0 ? 'win' : 'loss'}">${totalPnl}%</strong></div>
+                            <div class="stat-row"><span>Total Net PnL (USD):</span> <strong class="${totalPnlUsd >= 0 ? 'win' : 'loss'}">$${totalPnlUsd}</strong></div>
                             <div class="stat-row"><span>Bot Status:</span> <strong>${isTrading ? "Processing..." : "Scanning Markets..."}</strong></div>
                         </div>
                         <div class="card">
@@ -143,14 +158,15 @@ app.get('/', async (req, res) => {
                     <div class="card">
                         <h2>📝 Last 15 Trades</h2>
                         <table>
-                            <tr><th>Date</th><th>Side</th><th>Entry</th><th>Exit</th><th>Net PnL %</th><th>Result</th></tr>
+                            <tr><th>Date</th><th>Side</th><th>Entry</th><th>Exit</th><th>Net PnL ($)</th><th>Net PnL (%)</th><th>Result</th></tr>
                             ${recentTrades.map(t => `
                                 <tr>
                                     <td>${new Date(t.timestamp).toLocaleString()}</td>
                                     <td>${t.side}</td>
                                     <td>$${t.entryPrice.toFixed(2)}</td>
                                     <td>$${t.exitPrice.toFixed(2)}</td>
-                                    <td class="${t.isWin ? 'win' : 'loss'}">${t.pnlPercentage.toFixed(2)}%</td>
+                                    <td class="${t.isWin ? 'win' : 'loss'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
+                                    <td class="${t.isWin ? 'win' : 'loss'}">${(t.pnlPercentage || 0).toFixed(2)}%</td>
                                     <td class="${t.isWin ? 'win' : 'loss'}">${t.isWin ? 'WIN' : 'LOSS'}</td>
                                 </tr>
                             `).join('')}
@@ -195,7 +211,7 @@ async function getMarketContext() {
     const bb15m = BollingerBands.calculate({ period: 20, values: closes15m, stdDev: 2 }).pop();
     
     const obvValues15m = OBV.calculate({ close: closes15m, volume: volumes15m });
-    const isVolumeConfirming15m = trend1h === 'BULLISH' ? obvValues15m[obvValues15m.length - 1] > obvValues15m[obvValues15m.length - 4] : obvValues15m[obvValues15m.length - 1] < obvValues15m[obvValues15m.length - 4];
+    const isVolumeConfirming15m = trend1h === 'BULLISH' ? obvValues15m[obvValues15m.length - 1] > obvValues15m[obvValues15m.length - 4] : obvValues15m[obvValues15m.length - 4] > obvValues15m[obvValues15m.length - 1];
 
     return { 
         currentPrice, 
@@ -206,28 +222,55 @@ async function getMarketContext() {
 // ==========================================
 // EVOLUTION LOGIC (SELF-IMPROVEMENT)
 // ==========================================
-async function processTradeExit(side, entryPrice, exitPrice) {
+async function processTradeExit(side, entryPrice, exitPrice, contracts, contractSize) {
     try {
-        let rawPnl = 0;
+        // 1. Calculate the USD value of the position
+        const positionValueEntry = entryPrice * contracts * contractSize;
+        const positionValueExit = exitPrice * contracts * contractSize;
         
-        // 1. Calculate Raw PnL
+        // Initial Margin based on Leverage
+        const initialMarginUsd = positionValueEntry / leverage;
+
+        // 2. Calculate Raw PnL in USD
+        let rawPnlUsd = 0;
         if (side === 'LONG') {
-            rawPnl = ((exitPrice - entryPrice) / entryPrice) * 100 * leverage;
+            rawPnlUsd = (exitPrice - entryPrice) * contracts * contractSize;
         } else {
-            rawPnl = ((entryPrice - exitPrice) / entryPrice) * 100 * leverage;
+            rawPnlUsd = (entryPrice - exitPrice) * contracts * contractSize;
         }
         
-        // 2. Calculate Exact Fees (Entry + Exit fee, multiplied by leverage)
-        const totalFeePercentage = (takerFeeRate * 2) * leverage * 100;
+        // 3. Calculate Exact Fees in USD
+        const entryFeeUsd = positionValueEntry * takerFeeRate;
+        const exitFeeUsd = positionValueExit * takerFeeRate;
+        const totalFeeUsd = entryFeeUsd + exitFeeUsd;
         
-        // 3. Calculate True Net PnL
-        const netPnl = rawPnl - totalFeePercentage;
-        const isWin = netPnl > 0;
+        // 4. Calculate True Net PnL
+        const netPnlUsd = rawPnlUsd - totalFeeUsd;
+        const netPnlPercentage = (netPnlUsd / initialMarginUsd) * 100;
+        const isWin = netPnlUsd > 0;
 
-        await Trade.create({ side, entryPrice, exitPrice, pnlPercentage: netPnl, isWin });
-        console.log(`💾 [MEMORY] Trade saved. Result: ${isWin ? 'WIN' : 'LOSS'} | Net PnL: ${netPnl.toFixed(2)}%`);
+        // 5. Fetch Account Balance After Trade
+        const balanceData = await mexc.fetchBalance();
+        const currentUsdtBalance = balanceData.total['USDT'] || 0;
+
+        await Trade.create({ 
+            side, entryPrice, exitPrice, 
+            pnlPercentage: netPnlPercentage, 
+            pnlUsd: netPnlUsd,
+            balanceAfter: currentUsdtBalance,
+            isWin 
+        });
+
+        console.log(`💾 [MEMORY] Trade saved. Result: ${isWin ? 'WIN' : 'LOSS'} | Net PnL: $${netPnlUsd.toFixed(2)} (${netPnlPercentage.toFixed(2)}%)`);
         
-        sendTelegramAlert(`💸 TRADE CLOSED: ${side}\nResult: ${isWin ? 'WIN ✅' : 'LOSS ❌'}\nNet PnL (After Fees): ${netPnl.toFixed(2)}%\nEntry: $${entryPrice}\nExit: $${exitPrice}`);
+        sendTelegramAlert(
+            `💸 TRADE CLOSED: ${side}\n` +
+            `Result: ${isWin ? 'WIN ✅' : 'LOSS ❌'}\n` +
+            `Net PnL: $${netPnlUsd.toFixed(2)} (${netPnlPercentage.toFixed(2)}%)\n` +
+            `Entry: $${entryPrice}\n` +
+            `Exit: $${exitPrice}\n\n` +
+            `💼 Current Balance: $${currentUsdtBalance.toFixed(2)}`
+        );
 
         evolveBot();
     } catch (e) {
@@ -288,6 +331,10 @@ async function runBot() {
             }
         }
 
+        // Fetch Market config to correctly calculate contract sizes for PnL
+        const market = await mexc.market(symbol);
+        const contractSize = market.contractSize;
+
         const ctx = await getMarketContext();
         const balance = await mexc.fetchBalance();
         const usdtBalance = balance.total['USDT'] || 0;
@@ -304,7 +351,7 @@ async function runBot() {
         if (obiHistory.length > historyLimit) obiHistory.shift();
         const avgObi = obiHistory.reduce((a, b) => a + b, 0) / obiHistory.length;
 
-        console.log(`[LOG] Price: ${ctx.currentPrice} | Brain: AI-ACTIVE | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
+        console.log(`[LOG] Price: ${ctx.currentPrice} | Bal: $${usdtBalance.toFixed(2)} | Trend ADX: ${ctx.swing.strength.toFixed(1)}`);
 
         const activeAtr = ctx.swing.atr; 
         const trailMult = activeBrain.trailMultiplier;
@@ -314,6 +361,7 @@ async function runBot() {
         if (longPos) {
             if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
             const entryPrice = parseFloat(longPos.entryPrice);
+            const contractsAmount = parseFloat(longPos.contracts);
 
             let stopLoss = entryPrice - (activeAtr * stopMult);
             if (ctx.currentPrice > entryPrice + (activeAtr * trailMult)) stopLoss = Math.max(stopLoss, entryPrice);
@@ -324,8 +372,8 @@ async function runBot() {
 
             if (ctx.currentPrice < stopLoss || isSwingExit) {
                 console.log(`>>> EXIT LONG (SWING). MARKET STOP TRIGGERED.`);
-                await mexc.createMarketSellOrder(symbol, longPos.contracts, { 'reduceOnly': true });
-                await processTradeExit('LONG', entryPrice, ctx.currentPrice);
+                await mexc.createMarketSellOrder(symbol, contractsAmount, { 'reduceOnly': true });
+                await processTradeExit('LONG', entryPrice, ctx.currentPrice, contractsAmount, contractSize);
                 peakPrice = 0;
             }
         }
@@ -334,6 +382,7 @@ async function runBot() {
         if (shortPos) {
             if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
             const entryPrice = parseFloat(shortPos.entryPrice);
+            const contractsAmount = parseFloat(shortPos.contracts);
 
             let stopLoss = entryPrice + (activeAtr * stopMult);
             if (ctx.currentPrice < entryPrice - (activeAtr * trailMult)) stopLoss = Math.min(stopLoss, entryPrice);
@@ -344,15 +393,13 @@ async function runBot() {
 
             if (ctx.currentPrice > stopLoss || isSwingExit) {
                 console.log(`>>> EXIT SHORT (SWING). MARKET STOP TRIGGERED.`);
-                await mexc.createMarketBuyOrder(symbol, shortPos.contracts, { 'reduceOnly': true });
-                await processTradeExit('SHORT', entryPrice, ctx.currentPrice);
+                await mexc.createMarketBuyOrder(symbol, contractsAmount, { 'reduceOnly': true });
+                await processTradeExit('SHORT', entryPrice, ctx.currentPrice, contractsAmount, contractSize);
                 peakPrice = 0;
             }
         }
 
         // --- ENTRY LOGIC (MARKET ORDERS) ---
-        const market = await mexc.market(symbol);
-        const contractSize = market.contractSize; 
         const btcToTrade = (usdtBalance * riskFactor * leverage) / ctx.currentPrice;
         let contractsToTrade = Math.floor(btcToTrade / contractSize);
 
@@ -363,25 +410,25 @@ async function runBot() {
             if (ctx.currentPrice > ctx.swing.bb.middle && ctx.swing.rsi > activeBrain.rsiOverbought && ctx.swing.macd.histogram < 0 && avgObi < 0) {
                 console.log(`>>> SWING REVERSAL SHORT MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
+                sendTelegramAlert(`🚀 ENTRY ALERT: SHORT (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.currentPrice < ctx.swing.bb.middle && ctx.swing.rsi < activeBrain.rsiOversold && ctx.swing.macd.histogram > 0 && avgObi > 0) {
                 console.log(`>>> SWING REVERSAL LONG MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
+                sendTelegramAlert(`🚀 ENTRY ALERT: LONG (Reversal)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
             else if (ctx.swing.trend === 'BULLISH' && !isOverextendedLong && ctx.swing.macd.histogram > 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi > obiThreshold) {
                 console.log(`>>> SWING TREND LONG MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
+                sendTelegramAlert(`📈 ENTRY ALERT: LONG (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice; 
             } 
             else if (ctx.swing.trend === 'BEARISH' && !isOverextendedShort && ctx.swing.macd.histogram < 0 && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.volConfirm && avgObi < -obiThreshold) {
                 console.log(`>>> SWING TREND SHORT MARKET: ${contractsToTrade} Contracts`);
                 await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend) MARKET\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}`);
+                sendTelegramAlert(`📉 ENTRY ALERT: SHORT (Trend)\nPrice: ~$${ctx.currentPrice}\nContracts: ${contractsToTrade}\nBalance: $${usdtBalance.toFixed(2)}`);
                 obiHistory =[]; peakPrice = ctx.currentPrice;
             }
         }
@@ -403,7 +450,10 @@ async function startBot() {
         await loadBotBrain();
 
         console.log(`✅ SUCCESS: ELITE SNIPER V5 ACTIVE ON ${symbol}`);
-        sendTelegramAlert(`✅ Bot Started: Elite Sniper V5 is active on ${symbol}. Ready to trade.`);
+        
+        const balanceData = await mexc.fetchBalance();
+        const initialBal = balanceData.total['USDT'] || 0;
+        sendTelegramAlert(`✅ Bot Started: Elite Sniper V5 is active on ${symbol}.\nStarting Balance: $${initialBal.toFixed(2)}\nReady to trade.`);
         
         setInterval(runBot, 5000); 
     } catch (error) {
