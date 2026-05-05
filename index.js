@@ -2,10 +2,18 @@ const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
 const https = require('https');
-const { RSI, SMA, ATR, ADX, OBV, MACD, BollingerBands } = require('technicalindicators');
+const { RSI, SMA, ATR, ADX, MACD, BollingerBands } = require('technicalindicators');
 
 const app = express();
 const port = process.env.PORT || 10000;
+
+// ==========================================
+// BOT CONFIGURATION
+// ==========================================
+const symbol = 'BTC/USDT:USDT'; 
+const leverage = 10;
+const riskFactor = 0.95; 
+const takerFeeRate = 0.0002; // 0.02%
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -14,17 +22,12 @@ const mexc = new ccxt.mexc({
     enableRateLimit: true 
 });
 
-// ==========================================
-// BOT CONFIGURATION
-// ==========================================
-const symbol = 'BTC/USDT:USDT'; 
-const leverage = 10;
-const riskFactor = 0.95; 
-const takerFeeRate = 0.0002; 
+// Global States
 let isTrading = false;
 let peakPrice = 0; 
-let liveTotalEquity = 0; // Total Account Value (Balance + PnL)
+let liveTotalEquity = 0; 
 let activePosition = null;
+let lastTradeTime = 0; // To prevent revenge trading / churning
 
 // ==========================================
 // UTILS & NOTIFICATIONS
@@ -38,7 +41,7 @@ function sendTelegramAlert(message) {
 }
 
 // ==========================================
-// DATABASE & MEMORY
+// DATABASE SETUP (AI MEMORY)
 // ==========================================
 mongoose.connect(process.env.MONGO_URI).catch(err => console.error("❌ DB ERROR", err));
 
@@ -48,9 +51,9 @@ const TradeSchema = new mongoose.Schema({
     exitPrice: Number,
     pnlPercentage: Number,
     pnlUsd: Number,
-    equityAfter: Number, // Total account value after trade
+    equityAfter: Number, 
     isWin: Boolean,
-    startTime: { type: Date },
+    startTime: { type: Date, default: Date.now },
     endTime: { type: Date, default: Date.now }
 });
 const Trade = mongoose.model('Trade', TradeSchema);
@@ -58,21 +61,24 @@ const Trade = mongoose.model('Trade', TradeSchema);
 const BotBrain = mongoose.model('BotBrain', new mongoose.Schema({
     trailMultiplier: { type: Number, default: 1.5 },
     stopMultiplier: { type: Number, default: 2.0 },
-    takeProfitTrigger: { type: Number, default: 5.0 }, 
-    profitLockFloor: { type: Number, default: 2.0 },   
+    takeProfitTrigger: { type: Number, default: 5.0 }, // Tighten at 5%
+    profitLockFloor: { type: Number, default: 2.0 },   // Lock 2% min
     minTrendStrength: { type: Number, default: 25 }
 }));
 
 let activeBrain = { trailMultiplier: 1.5, stopMultiplier: 2.0, takeProfitTrigger: 5.0, profitLockFloor: 2.0, minTrendStrength: 25 };
 
 async function loadBotBrain() {
-    let brain = await BotBrain.findOne();
-    if (!brain) brain = await BotBrain.create({});
-    activeBrain = brain;
+    try {
+        let brain = await BotBrain.findOne();
+        if (!brain) brain = await BotBrain.create({});
+        activeBrain = brain;
+        console.log("🧬 AI DNA Loaded:", activeBrain);
+    } catch(e) { console.log("Brain Load Error"); }
 }
 
 // ==========================================
-// DASHBOARD UI
+// DASHBOARD UI (FIXED & SAFE)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -81,69 +87,75 @@ app.get('/', async (req, res) => {
         const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0).toFixed(2);
 
         const posHtml = activePosition ? `
-            <div style="background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #0ea5e9;">
+            <div style="background: #1e293b; padding: 20px; border-radius: 12px; border: 1px solid #0ea5e9; box-shadow: 0 0 15px rgba(14, 165, 233, 0.3);">
                 <h2 style="color: #38bdf8; margin: 0;">🟢 ACTIVE: ${activePosition.side}</h2>
-                <div style="display: grid; grid-template-columns: 1fr 1fr; margin-top: 10px;">
-                    <div>Entry: <b>$${activePosition.entryPrice}</b></div>
-                    <div>PnL: <b style="color: ${activePosition.pnlPct >= 0 ? '#22c55e' : '#ef4444'}">${activePosition.pnlPct.toFixed(2)}%</b></div>
-                    <div>Started: <b>${new Date(activePosition.startTime).toLocaleTimeString()}</b></div>
-                    <div style="color: #facc15">Mode: ${activePosition.pnlPct > activeBrain.takeProfitTrigger ? '🔥 BREAKOUT' : '🔍 MONITORING'}</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px;">
+                    <div>Entry: <b>$${(activePosition.entryPrice || 0).toFixed(2)}</b></div>
+                    <div>Unrealized PnL: <b style="color: ${(activePosition.pnlPct || 0) >= 0 ? '#22c55e' : '#ef4444'}">${(activePosition.pnlPct || 0).toFixed(2)}%</b></div>
+                    <div>Time In Trade: <b>${Math.floor((Date.now() - activePosition.startTime)/60000)}m</b></div>
+                    <div style="color: #facc15; font-weight: bold;">Mode: ${(activePosition.pnlPct || 0) > activeBrain.takeProfitTrigger ? '🔥 BREAKOUT TRAILING' : '🔍 MONITORING'}</div>
                 </div>
             </div>
-        ` : `<div style="padding: 20px; border: 1px dashed #334155; color: #94a3b8; border-radius: 12px;">⚪ NO ACTIVE TRADES - SCANNING MARKET</div>`;
+        ` : `<div style="padding: 30px; border: 1px dashed #334155; color: #94a3b8; border-radius: 12px; text-align: center;">⚪ NO ACTIVE POSITIONS - SCANNING MARKET</div>`;
 
         res.send(`
-            <html><head><title>Sniper V5.1</title><meta http-equiv="refresh" content="5"></head>
-            <body style="background:#0b0f19; color:white; font-family:sans-serif; padding: 20px;">
-                <h1 style="color: #38bdf8">🎯 Elite Sniper V5.1</h1>
-                <div style="display:flex; gap: 20px; margin-bottom: 20px;">
-                    <div style="background:#1e293b; padding:15px; border-radius:10px; flex:1;">
-                        <span style="color:#94a3b8">TOTAL ACCOUNT EQUITY</span><br>
-                        <strong style="font-size: 24px; color: #facc15">$${liveTotalEquity.toFixed(2)}</strong>
+            <html><head><title>Elite Sniper V5.2</title><meta http-equiv="refresh" content="10"></head>
+            <body style="background:#0b0f19; color:#e2e8f0; font-family: 'Segoe UI', sans-serif; padding: 20px;">
+                <div style="max-width: 900px; margin: auto;">
+                    <h1 style="color: #38bdf8; text-align: center;">🎯 Elite Sniper V5.2</h1>
+                    
+                    <div style="display:flex; gap: 20px; margin-bottom: 20px;">
+                        <div style="background:#1e293b; padding:20px; border-radius:12px; flex:1; border: 1px solid #334155;">
+                            <div style="color:#94a3b8; font-size: 12px; margin-bottom: 5px;">TOTAL ACCOUNT EQUITY</div>
+                            <strong style="font-size: 28px; color: #facc15">$${(liveTotalEquity || 0).toFixed(2)}</strong>
+                        </div>
+                        <div style="background:#1e293b; padding:20px; border-radius:12px; flex:1; border: 1px solid #334155;">
+                            <div style="color:#94a3b8; font-size: 12px; margin-bottom: 5px;">TOTAL NET PROFIT</div>
+                            <strong style="font-size: 28px; color: ${parseFloat(totalPnlUsd) >= 0 ? '#22c55e':'#ef4444'}">$${totalPnlUsd}</strong>
+                        </div>
                     </div>
-                    <div style="background:#1e293b; padding:15px; border-radius:10px; flex:1;">
-                        <span style="color:#94a3b8">TOTAL ACCUMULATED PNL</span><br>
-                        <strong style="font-size: 24px; color: ${totalPnlUsd >=0 ? '#22c55e':'#ef4444'}">$${totalPnlUsd}</strong>
-                    </div>
+
+                    ${posHtml}
+
+                    <h3 style="margin-top:40px; color: #94a3b8;">📜 RECENT TRADE JOURNAL</h3>
+                    <table style="width:100%; border-collapse: collapse; background: #1e293b; border-radius: 12px; overflow: hidden;">
+                        <tr style="background:#0f172a; color:#94a3b8; text-align: left;">
+                            <th style="padding:15px;">Closed At</th>
+                            <th style="padding:15px;">Side</th>
+                            <th style="padding:15px;">PnL %</th>
+                            <th style="padding:15px;">PnL USD</th>
+                            <th style="padding:15px;">Equity After</th>
+                        </tr>
+                        ${recentTrades.map(t => `
+                            <tr style="border-bottom: 1px solid #334155;">
+                                <td style="padding:15px; font-size: 14px;">${t.endTime ? new Date(t.endTime).toLocaleString() : 'N/A'}</td>
+                                <td style="padding:15px; font-weight: bold;">${t.side || 'N/A'}</td>
+                                <td style="padding:15px; color:${(t.pnlPercentage || 0) >= 0 ? '#22c55e' : '#ef4444'}">${(t.pnlPercentage || 0).toFixed(2)}%</td>
+                                <td style="padding:15px; color:${(t.pnlUsd || 0) >= 0 ? '#22c55e' : '#ef4444'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
+                                <td style="padding:15px;">$${(t.equityAfter || 0).toFixed(2)}</td>
+                            </tr>
+                        `).join('')}
+                    </table>
                 </div>
-                ${posHtml}
-                <h3 style="margin-top:30px;">📝 TRADE HISTORY (START/END TIME)</h3>
-                <table style="width:100%; border-collapse: collapse; text-align: left;">
-                    <tr style="background:#1e293b; color:#94a3b8;"><th style="padding:10px;">Entry Time</th><th style="padding:10px;">Side</th><th style="padding:10px;">PnL %</th><th style="padding:10px;">Duration</th><th style="padding:10px;">Total Equity After</th></tr>
-                    ${recentTrades.map(t => {
-                        const duration = Math.floor((t.endTime - t.startTime) / 60000); // in minutes
-                        return `<tr style="border-bottom: 1px solid #334155;">
-                            <td style="padding:10px;">${new Date(t.startTime).toLocaleString()}</td>
-                            <td style="padding:10px;">${t.side}</td>
-                            <td style="padding:10px; color:${t.isWin ? '#22c55e' : '#ef4444'}">${t.pnlPercentage.toFixed(2)}%</td>
-                            <td style="padding:10px;">${duration}m</td>
-                            <td style="padding:10px;">$${t.equityAfter.toFixed(2)}</td>
-                        </tr>`;
-                    }).join('')}
-                </table>
             </body></html>
         `);
-    } catch (e) { res.send("Dashboard error: " + e.message); }
+    } catch (e) { res.send(`Dashboard error: ${e.message}`); }
 });
 
+app.listen(port, () => console.log(`🌐 Server active on port ${port}`));
+
 // ==========================================
-// LOGIC FUNCTIONS
+// CORE LOGIC & ANTI-CHURN
 // ==========================================
 async function updateAccountEquity() {
-    const balance = await mexc.fetchBalance();
-    const positions = await mexc.fetchPositions([symbol]);
-    
-    // Total Equity = Wallet Balance + Unrealized PnL
-    let walletBalance = balance.total['USDT'] || 0;
-    let totalUnrealizedPnl = 0;
-
-    positions.forEach(p => {
-        if (parseFloat(p.contracts) > 0) {
-            totalUnrealizedPnl += parseFloat(p.unrealizedPnl || 0);
-        }
-    });
-
-    liveTotalEquity = walletBalance + totalUnrealizedPnl;
+    try {
+        const balance = await mexc.fetchBalance();
+        const positions = await mexc.fetchPositions([symbol]);
+        let walletBalance = balance.total['USDT'] || 0;
+        let totalUnrealizedPnl = 0;
+        positions.forEach(p => { if (parseFloat(p.contracts) > 0) totalUnrealizedPnl += parseFloat(p.unrealizedPnl || 0); });
+        liveTotalEquity = walletBalance + totalUnrealizedPnl;
+    } catch(e) { console.error("Equity Sync Failed"); }
 }
 
 async function getMarketContext() {
@@ -177,21 +189,15 @@ async function processTradeExit(side, entryPrice, exitPrice, contracts, contract
         await Trade.create({ 
             side, entryPrice, exitPrice, 
             pnlPercentage: (netPnlUsd / initialMarginUsd) * 100, 
-            pnlUsd: netPnlUsd, 
-            equityAfter: liveTotalEquity, 
-            isWin: netPnlUsd > 0,
-            startTime: startTime,
-            endTime: new Date()
+            pnlUsd: netPnlUsd, equityAfter: liveTotalEquity, isWin: netPnlUsd > 0,
+            startTime: startTime || new Date(), endTime: new Date()
         });
         
         sendTelegramAlert(`💸 CLOSED ${side}\nNet: $${netPnlUsd.toFixed(2)}\nEquity: $${liveTotalEquity.toFixed(2)}`);
         activePosition = null;
-    } catch (e) { console.error("Exit processing error:", e.message); }
+    } catch (e) { console.error("Trade recording error:", e.message); }
 }
 
-// ==========================================
-// BOT LOOP
-// ==========================================
 async function runBot() {
     if (isTrading) return; 
     isTrading = true;
@@ -200,76 +206,87 @@ async function runBot() {
         const ctx = await getMarketContext();
         const market = await mexc.market(symbol);
         const contractSize = market.contractSize;
+        const now = Date.now();
 
         const positions = await mexc.fetchPositions([symbol]);
         const longPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'long');
         const shortPos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0 && p.side === 'short');
 
-        // POSITION RECOVERY (If bot restarts during a trade)
         if (longPos || shortPos) {
             const pos = longPos || shortPos;
             const entry = parseFloat(pos.entryPrice);
             const side = longPos ? 'LONG' : 'SHORT';
             const pnl = side === 'LONG' ? ((ctx.currentPrice - entry) / entry) * leverage * 100 : ((entry - ctx.currentPrice) / entry) * leverage * 100;
             
-            if (!activePosition) {
-                activePosition = { side, entryPrice: entry, startTime: new Date(pos.timestamp || Date.now()), pnlPct: pnl };
-            } else {
-                activePosition.pnlPct = pnl;
-            }
-        }
+            if (!activePosition) activePosition = { side, entryPrice: entry, startTime: now, pnlPct: pnl };
+            else activePosition.pnlPct = pnl;
 
-        // MANAGEMENT LOGIC
-        if (longPos) {
-            if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
-            let stopLoss = activePosition.entryPrice - (ctx.swing.atr * activeBrain.stopMultiplier);
-            
-            if (activePosition.pnlPct >= activeBrain.takeProfitTrigger) {
-                const floor = activePosition.entryPrice * (1 + (activeBrain.profitLockFloor / 100 / leverage));
-                const trail = peakPrice - (ctx.swing.atr * (activeBrain.trailMultiplier * 0.7)); 
-                stopLoss = Math.max(floor, trail);
-            } else {
-                stopLoss = Math.max(stopLoss, peakPrice - (ctx.swing.atr * activeBrain.trailMultiplier));
-            }
+            // --- ANTI-CHURN LOGIC ---
+            const durationSec = (now - activePosition.startTime) / 1000;
+            const isEmergency = activePosition.pnlPct < -4.0; // Hard fail-safe
 
-            if (ctx.currentPrice < stopLoss) {
-                await mexc.createMarketSellOrder(symbol, parseFloat(longPos.contracts), { 'reduceOnly': true });
-                await processTradeExit('LONG', activePosition.entryPrice, ctx.currentPrice, parseFloat(longPos.contracts), contractSize, activePosition.startTime);
-                peakPrice = 0;
-            }
-        } else if (shortPos) {
-            if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
-            let stopLoss = activePosition.entryPrice + (ctx.swing.atr * activeBrain.stopMultiplier);
+            if (durationSec > 40 || isEmergency) { // Give it 40 seconds to breathe
+                
+                // --- DYNAMIC STOP LOSS ---
+                const minStopDistance = ctx.currentPrice * 0.0018; // At least 0.18% away
+                const atrDistance = ctx.swing.atr * activeBrain.stopMultiplier;
+                const buffer = Math.max(atrDistance, minStopDistance);
 
-            if (activePosition.pnlPct >= activeBrain.takeProfitTrigger) {
-                const floor = activePosition.entryPrice * (1 - (activeBrain.profitLockFloor / 100 / leverage));
-                const trail = peakPrice + (ctx.swing.atr * (activeBrain.trailMultiplier * 0.7));
-                stopLoss = Math.min(floor, trail);
-            } else {
-                stopLoss = Math.min(stopLoss, peakPrice + (ctx.swing.atr * activeBrain.trailMultiplier));
-            }
+                if (side === 'LONG') {
+                    if (peakPrice === 0 || ctx.currentPrice > peakPrice) peakPrice = ctx.currentPrice;
+                    let stopLoss = entry - buffer;
 
-            if (ctx.currentPrice > stopLoss) {
-                await mexc.createMarketBuyOrder(symbol, parseFloat(shortPos.contracts), { 'reduceOnly': true });
-                await processTradeExit('SHORT', activePosition.entryPrice, ctx.currentPrice, parseFloat(shortPos.contracts), contractSize, activePosition.startTime);
-                peakPrice = 0;
-            }
-        }
+                    if (activePosition.pnlPct >= activeBrain.takeProfitTrigger) {
+                        const floor = entry * (1 + (activeBrain.profitLockFloor / 100 / leverage));
+                        const trail = peakPrice - (ctx.swing.atr * activeBrain.trailMultiplier * 0.6);
+                        stopLoss = Math.max(floor, trail);
+                    } else {
+                        stopLoss = Math.max(stopLoss, peakPrice - (ctx.swing.atr * activeBrain.trailMultiplier));
+                    }
 
-        // ENTRY LOGIC
-        if (!longPos && !shortPos && liveTotalEquity > 10) {
-            const contractsToTrade = Math.floor((liveTotalEquity * riskFactor * leverage) / ctx.currentPrice / contractSize);
-            if (contractsToTrade >= 1) {
-                if (ctx.swing.trend === 'BULLISH' && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.macd.histogram > 0) {
-                    await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                    activePosition = { side: 'LONG', entryPrice: ctx.currentPrice, startTime: new Date(), pnlPct: 0 };
-                    sendTelegramAlert(`🚀 LONG ENTRY\nPrice: $${ctx.currentPrice}\nEquity: $${liveTotalEquity.toFixed(2)}`);
-                    peakPrice = ctx.currentPrice;
-                } else if (ctx.swing.trend === 'BEARISH' && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.macd.histogram < 0) {
-                    await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                    activePosition = { side: 'SHORT', entryPrice: ctx.currentPrice, startTime: new Date(), pnlPct: 0 };
-                    sendTelegramAlert(`📉 SHORT ENTRY\nPrice: $${ctx.currentPrice}\nEquity: $${liveTotalEquity.toFixed(2)}`);
-                    peakPrice = ctx.currentPrice;
+                    if (ctx.currentPrice < stopLoss) {
+                        await mexc.createMarketSellOrder(symbol, parseFloat(longPos.contracts), { 'reduceOnly': true });
+                        await processTradeExit('LONG', entry, ctx.currentPrice, parseFloat(longPos.contracts), contractSize, activePosition.startTime);
+                        peakPrice = 0; lastTradeTime = now;
+                    }
+                } else {
+                    if (peakPrice === 0 || ctx.currentPrice < peakPrice) peakPrice = ctx.currentPrice;
+                    let stopLoss = entry + buffer;
+
+                    if (activePosition.pnlPct >= activeBrain.takeProfitTrigger) {
+                        const floor = entry * (1 - (activeBrain.profitLockFloor / 100 / leverage));
+                        const trail = peakPrice + (ctx.swing.atr * activeBrain.trailMultiplier * 0.6);
+                        stopLoss = Math.min(floor, trail);
+                    } else {
+                        stopLoss = Math.min(stopLoss, peakPrice + (ctx.swing.atr * activeBrain.trailMultiplier));
+                    }
+
+                    if (ctx.currentPrice > stopLoss) {
+                        await mexc.createMarketBuyOrder(symbol, parseFloat(shortPos.contracts), { 'reduceOnly': true });
+                        await processTradeExit('SHORT', entry, ctx.currentPrice, parseFloat(shortPos.contracts), contractSize, activePosition.startTime);
+                        peakPrice = 0; lastTradeTime = now;
+                    }
+                }
+            }
+        } else {
+            // --- ENTRY COOLDOWN (2 MINS) ---
+            if (now - lastTradeTime < 120000) return;
+
+            if (liveTotalEquity > 10) {
+                const contractsToTrade = Math.floor((liveTotalEquity * riskFactor * leverage) / ctx.currentPrice / contractSize);
+                if (contractsToTrade >= 1) {
+                    if (ctx.swing.trend === 'BULLISH' && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.macd.histogram > 0) {
+                        await mexc.createMarketBuyOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        activePosition = { side: 'LONG', entryPrice: ctx.currentPrice, startTime: now, pnlPct: 0 };
+                        sendTelegramAlert(`🚀 LONG ENTRY: $${ctx.currentPrice}\nEquity: $${liveTotalEquity.toFixed(2)}`);
+                        peakPrice = ctx.currentPrice;
+                    } 
+                    else if (ctx.swing.trend === 'BEARISH' && ctx.swing.strength > activeBrain.minTrendStrength && ctx.swing.macd.histogram < 0) {
+                        await mexc.createMarketSellOrder(symbol, contractsToTrade, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        activePosition = { side: 'SHORT', entryPrice: ctx.currentPrice, startTime: now, pnlPct: 0 };
+                        sendTelegramAlert(`📉 SHORT ENTRY: $${ctx.currentPrice}\nEquity: $${liveTotalEquity.toFixed(2)}`);
+                        peakPrice = ctx.currentPrice;
+                    }
                 }
             }
         }
@@ -278,8 +295,12 @@ async function runBot() {
 }
 
 async function startBot() {
-    await loadBotBrain();
-    app.listen(port);
-    setInterval(runBot, 7000); 
+    try {
+        await mexc.loadMarkets();
+        await loadBotBrain();
+        console.log("✅ ELITE SNIPER V5.2 ACTIVE");
+        sendTelegramAlert("✅ Elite Sniper V5.2 is online.");
+        setInterval(runBot, 8000); 
+    } catch(e) { console.error("Startup Error:", e.message); }
 }
 startBot();
