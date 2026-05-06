@@ -81,19 +81,36 @@ async function getMarketContext() {
         return latestMarketCtx; 
     }
 
-    const[ohlcv1m, ohlcv5m] = await Promise.all([
+    // 🛠️ OPTIMIZATION: Added 1H OHLCV fetch for the Trend Filter (200 SMA)
+    const[ohlcv1m, ohlcv5m, ohlcv1h] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1m', undefined, 60),
-        mexc.fetchOHLCV(symbol, '5m', undefined, 60)
+        mexc.fetchOHLCV(symbol, '5m', undefined, 60),
+        mexc.fetchOHLCV(symbol, '1h', undefined, 200) 
     ]);
     
     const closes1m = ohlcv1m.map(c => c[4]);
     const closes5m = ohlcv5m.map(c => c[4]);
+    const closes1h = ohlcv1h.map(c => c[4]);
 
     const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
     const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop();
     const atr5m = ATR.calculate({ period: 14, high: ohlcv5m.map(c => c[2]), low: ohlcv5m.map(c => c[3]), close: closes5m }).pop();
 
-    latestMarketCtx = { rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m };
+    // 🛠️ OPTIMIZATION: Calculate 200 SMA (Fallback to smaller SMA if less than 200 candles exist)
+    let sma1h = null;
+    if (closes1h.length >= 200) {
+        sma1h = SMA.calculate({ period: 200, values: closes1h }).pop();
+    } else if (closes1h.length > 0) {
+        sma1h = SMA.calculate({ period: closes1h.length, values: closes1h }).pop();
+    }
+
+    latestMarketCtx = { 
+        rsi: rsi1m, 
+        bbUpper: bb1m.upper, 
+        bbLower: bb1m.lower, 
+        atr: atr5m,
+        sma1h: sma1h
+    };
     lastOhlcvFetchTime = now;
     return latestMarketCtx;
 }
@@ -102,7 +119,11 @@ async function runBot() {
     if (isTrading) return; 
     isTrading = true;
     try {
-        const ticker = await mexc.fetchTicker(symbol);
+        // 🛠️ OPTIMIZATION: Grouped API calls using Promise.all to save latency
+        const [ticker, positions] = await Promise.all([
+            mexc.fetchTicker(symbol),
+            mexc.fetchPositions([symbol])
+        ]);
         currentMarketPrice = ticker.last;
 
         const ctx = await getMarketContext();
@@ -111,7 +132,6 @@ async function runBot() {
             globalContractSize = market.contractSize;
         }
 
-        const positions = await mexc.fetchPositions([symbol]);
         const pos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0);
 
         if (pos) {
@@ -126,7 +146,13 @@ async function runBot() {
             const pnlPct = (pnlUsd / liveMarginUsed) * 100;
             
             liveUnrealizedPnl = pnlUsd;
-            if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
+
+            // 🛠️ FIX: Added initialAtr to lock in the Stop Loss distance at the start of the trade
+            if(!activePosition) {
+                activePosition = { side, entryPrice: entry, startTime: Date.now(), size, initialAtr: ctx.atr };
+            } else if (!activePosition.initialAtr) {
+                activePosition.initialAtr = ctx.atr; // Failsafe if state lost
+            }
             activePosition.pnlPct = pnlPct;
 
             const openOrders = await mexc.fetchOpenOrders(symbol);
@@ -135,7 +161,8 @@ async function runBot() {
                 console.log("🧹 Traps cleared. Transitioned to active position management.");
             }
 
-            const stopDist = ctx.atr * 1.5; 
+            // 🛠️ FIX: Stop Loss now relies on the locked initial ATR, preventing it from drifting!
+            const stopDist = activePosition.initialAtr * 1.5; 
             const tpDist = stopDist * 2.0;
 
             if (side === 'LONG') {
@@ -168,31 +195,61 @@ async function runBot() {
             const stopDist = ctx.atr * 1.5;
             // Calculate base balance (Available + Margin) to determine total risk allowed
             const totalBaseEquity = liveWalletBalance + liveMarginUsed;
-            const contracts = Math.floor((totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize));
+            const rawContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize);
             
-            if (contracts >= 1) {
+            // 🛠️ FIX: Strict precision formatting according to CCXT exchange rules
+            let contracts = 0;
+            try {
+                contracts = parseFloat(mexc.amountToPrecision(symbol, rawContracts));
+            } catch (e) {
+                contracts = Math.floor(rawContracts); // Fallback if API hasn't synced
+            }
+            
+            if (contracts > 0) {
                 const openOrders = await mexc.fetchOpenOrders(symbol);
                 let needsUpdate = false;
 
                 const buyTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbLower * 1.0005));
                 const sellTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbUpper * 0.9995));
 
-                if (openOrders.length === 0) needsUpdate = true;
-                else if (openOrders.length === 2) {
+                // 🛠️ FIX: Trend Filter - Decide which trades are allowed based on 1H SMA
+                const allowLong = ctx.sma1h ? currentMarketPrice > ctx.sma1h : true;
+                const allowShort = ctx.sma1h ? currentMarketPrice < ctx.sma1h : true;
+
+                if (openOrders.length === 0) {
+                    needsUpdate = true;
+                } else {
                     const buyO = openOrders.find(o => o.side === 'buy');
                     const sellO = openOrders.find(o => o.side === 'sell');
-                    if (buyO && sellO) {
+
+                    // If an order exists but is going against the new trend, force update
+                    if ((buyO && !allowLong) || (sellO && !allowShort)) {
+                        needsUpdate = true;
+                    }
+
+                    // Check for price drift
+                    if (buyO && allowLong) {
                         const buyDrift = Math.abs(parseFloat(buyO.price) - buyTrapPrice) / buyTrapPrice;
+                        if (buyDrift > 0.0015) needsUpdate = true;
+                    }
+                    if (sellO && allowShort) {
                         const sellDrift = Math.abs(parseFloat(sellO.price) - sellTrapPrice) / sellTrapPrice;
-                        if (buyDrift > 0.0015 || sellDrift > 0.0015) needsUpdate = true;
-                    } else needsUpdate = true;
-                } else needsUpdate = true;
+                        if (sellDrift > 0.0015) needsUpdate = true;
+                    }
+                }
 
                 if (needsUpdate) {
                     if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
-                    await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                    await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                    console.log(`🕸️ Traps set: BUY @ ${buyTrapPrice} | SELL @ ${sellTrapPrice}`);
+                    
+                    // 🛠️ FIX: Only set traps in the direction of the 1-Hour Trend
+                    if (allowLong) {
+                        await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        console.log(`🕸️ BUY Trap set @ ${buyTrapPrice} (Uptrend)`);
+                    }
+                    if (allowShort) {
+                        await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        console.log(`🕸️ SELL Trap set @ ${sellTrapPrice} (Downtrend)`);
+                    }
                 }
             }
         }
