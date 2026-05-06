@@ -29,7 +29,7 @@ let liveTotalEquity = 0;
 let liveWalletBalance = 0;
 let liveUnrealizedPnl = 0;
 let currentMarketPrice = 0;
-let globalContractSize = 0.0001; // Default, updates dynamically
+let globalContractSize = 0.0001; 
 let activePosition = null;
 let lastTradeTime = 0; 
 let lastTradedCandleTime = 0; 
@@ -120,17 +120,8 @@ async function evolveBrain() {
 async function updateAccountEquity() {
     try {
         const balance = await mexc.fetchBalance();
-        const positions = await mexc.fetchPositions([symbol]);
-        
-        liveWalletBalance = balance.total['USDT'] || 0;
-        
-        let pnl = 0;
-        positions.forEach(p => { 
-            if (parseFloat(p.contracts) > 0) pnl += parseFloat(p.unrealizedPnl || 0); 
-        });
-        
-        liveUnrealizedPnl = pnl;
-        liveTotalEquity = liveWalletBalance + liveUnrealizedPnl;
+        // MEXC often reports balance.total as strictly the FREE balance if margin is isolated.
+        liveWalletBalance = balance.total['USDT'] || 0; 
     } catch(e) { console.error("Equity Sync Failed"); }
 }
 
@@ -162,7 +153,12 @@ async function processTradeExit(side, entryPrice, exitPrice, contracts, contract
         const totalFeeUsd = (entryPrice + exitPrice) * contracts * contractSize * takerFeeRate;
         const netPnlUsd = rawPnlUsd - totalFeeUsd;
         
+        // Reset manual UI globals on exit
+        liveUnrealizedPnl = 0; 
+        activePosition = null;
+        
         await updateAccountEquity();
+        liveTotalEquity = liveWalletBalance; // After exit, wallet balance contains full margin + profit
 
         await Trade.create({ 
             side, entryPrice, exitPrice, 
@@ -172,7 +168,6 @@ async function processTradeExit(side, entryPrice, exitPrice, contracts, contract
         });
         
         sendTelegramAlert(`💸 CLOSED ${side}\nNet: $${netPnlUsd.toFixed(2)}\nEquity: $${liveTotalEquity.toFixed(2)}`);
-        activePosition = null;
         
         if (Math.random() > 0.7) evolveBrain(); 
 
@@ -198,10 +193,24 @@ async function runBot() {
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
             const side = longPos ? 'LONG' : 'SHORT';
-            const pnl = side === 'LONG' ? ((ctx.currentPrice - entry) / entry) * leverage * 100 : ((entry - ctx.currentPrice) / entry) * leverage * 100;
             
-            if (!activePosition) activePosition = { side, entryPrice: entry, startTime: now, pnlPct: pnl, size };
-            else { activePosition.pnlPct = pnl; activePosition.size = size; }
+            // --- FIX: MANUAL PNL & EQUITY CALCULATION ---
+            // Bypassing CCXT's empty unrealizedPnl field and calculating it exactly
+            const marginUsed = (entry * size * globalContractSize) / leverage;
+            const pnlPct = side === 'LONG' ? ((ctx.currentPrice - entry) / entry) * leverage * 100 : ((entry - ctx.currentPrice) / entry) * leverage * 100;
+            const pnlUsd = side === 'LONG' ? (ctx.currentPrice - entry) * size * globalContractSize : (entry - ctx.currentPrice) * size * globalContractSize;
+            
+            liveUnrealizedPnl = pnlUsd;
+            
+            // Fix MEXC Equity Bug (If Wallet < Margin, MEXC hid the margin from the total balance)
+            if (liveWalletBalance < marginUsed) {
+                liveTotalEquity = liveWalletBalance + marginUsed + liveUnrealizedPnl;
+            } else {
+                liveTotalEquity = liveWalletBalance + liveUnrealizedPnl;
+            }
+
+            if (!activePosition) activePosition = { side, entryPrice: entry, startTime: now, pnlPct: pnlPct, size };
+            else { activePosition.pnlPct = pnlPct; activePosition.size = size; }
 
             const durationSec = (now - activePosition.startTime) / 1000;
             const isEmergency = activePosition.pnlPct < -10.0; 
@@ -252,6 +261,11 @@ async function runBot() {
                 }
             }
         } else {
+            // No Active Position: Reset calculations
+            liveUnrealizedPnl = 0;
+            liveTotalEquity = liveWalletBalance; 
+            activePosition = null;
+
             if (ctx.currentCandleTime === lastTradedCandleTime) return;
 
             if (liveTotalEquity > 10) {
@@ -282,7 +296,7 @@ async function startBot() {
     try {
         await mexc.loadMarkets();
         await loadBotBrain();
-        console.log("✅ ELITE SNIPER V5.4 ACTIVE");
+        console.log("✅ ELITE SNIPER V5.5 ACTIVE");
         setInterval(runBot, 8000); 
     } catch(e) { console.error("Startup Error:", e.message); }
 }
@@ -326,7 +340,7 @@ app.get('/', async (req, res) => {
                     </div>
                     <div class="stat-box">
                         <span class="label">Unrealized PnL</span>
-                        <span class="value ${pnlColor}">${(activePosition.pnlPct || 0).toFixed(2)}% <span style="font-size:14px; opacity:0.8;">($${liveUnrealizedPnl.toFixed(2)})</span></span>
+                        <span class="value ${pnlColor}">${(activePosition.pnlPct || 0).toFixed(2)}% <span style="font-size:14px; opacity:0.8;">(${liveUnrealizedPnl > 0 ? '+' : ''}$${liveUnrealizedPnl.toFixed(2)})</span></span>
                     </div>
                     <div class="stat-box">
                         <span class="label">Bot Mode</span>
@@ -356,7 +370,7 @@ app.get('/', async (req, res) => {
             <!DOCTYPE html>
             <html lang="en">
             <head>
-                <title>Elite Sniper V5.4</title>
+                <title>Elite Sniper V5.5</title>
                 <meta http-equiv="refresh" content="5">
                 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
                 <style>
@@ -404,12 +418,12 @@ app.get('/', async (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V5.4 Terminal</h1>
+                    <h1>🎯 Elite Sniper V5.5 Terminal</h1>
                     <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())}</div>
                     
                     <div class="grid grid-cols-4 gap-4">
                         <div class="card">
-                            <div class="stat-title">Available Wallet</div>
+                            <div class="stat-title">Free Wallet Balance</div>
                             <div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div>
                         </div>
                         <div class="card">
@@ -422,7 +436,7 @@ app.get('/', async (req, res) => {
                         </div>
                         <div class="card">
                             <div class="stat-title">All-Time Net / Win Rate</div>
-                            <div class="stat-value ${parseFloat(totalPnlUsd) >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd} <span style="font-size: 14px; color: var(--muted);">(${winRate}%)</span></div>
+                            <div class="stat-value ${parseFloat(totalPnlUsd) >= 0 ? 'text-green':'text-red'}">${parseFloat(totalPnlUsd) > 0 ? '+' : ''}$${totalPnlUsd} <span style="font-size: 14px; color: var(--muted);">(${winRate}%)</span></div>
                         </div>
                     </div>
 
