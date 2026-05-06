@@ -250,7 +250,7 @@ async function recordExit(side, entry, exit, size, start) {
 }
 
 // ==========================================
-// DASHBOARD (FIXED NULL CHECKS)
+// DASHBOARD
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -277,14 +277,14 @@ app.get('/', async (req, res) => {
             </div></div>`;
         }
 
-        res.send(`<!DOCTYPE html><html><head><title>Elite Sniper V7.9</title><meta http-equiv="refresh" content="5">
+        res.send(`<!DOCTYPE html><html><head><title>Elite Sniper V8.0</title><meta http-equiv="refresh" content="5">
         <style>body{background:#0b0f19;color:#f8fafc;font-family:sans-serif;padding:20px}
         .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}
         .card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}
         .active-card{background:#0f172a;border:1px solid #0ea5e9;padding:20px;margin:20px 0;border-radius:8px}
         .text-green{color:#10b981}.text-red{color:#ef4444}
         table{width:100%;border-collapse:collapse;margin-top:20px}th,td{padding:12px;text-align:left;border-bottom:1px solid #334155}</style></head><body>
-        <h1>🎯 Elite Sniper V7.9</h1>
+        <h1>🎯 Elite Sniper V8.0</h1>
         <div class="grid"><div class="card">Equity: $${(displayEquity || 0).toFixed(2)}</div><div class="card">Win Rate: ${winRate}%</div><div class="card">Net: $${(totalPnlUsd || 0).toFixed(2)}</div><div class="card">BTC: $${currentMarketPrice}</div></div>
         ${posHtml}
         <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL $</th></tr>
@@ -296,13 +296,28 @@ app.get('/', async (req, res) => {
 async function start() {
     try {
         await mexc.loadMarkets();
-        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
-        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
+        
+        // FIX: Clear existing orders first so leverage can be adjusted
+        console.log("Cleaning up open orders for startup...");
+        try {
+            await mexc.cancelAllOrders(symbol);
+        } catch(e) { console.log("No orders to cancel."); }
+
+        console.log("Setting leverage on MEXC...");
+        try {
+            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
+            await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
+        } catch(e) {
+            console.log("Leverage update skipped: " + e.message);
+        }
+        
         await updateAccountEquity();
         setInterval(runBot, 3000);
         setInterval(updateAccountEquity, 15000); 
-        console.log("🚀 V7.9 Resilience Update Active.");
-    } catch (e) { console.error("Startup Error:", e.message); }
+        console.log("🚀 V8.0 Startup Fix Active.");
+    } catch (e) {
+        console.error("Fatal Startup Error:", e.message);
+    }
 }
 
 app.listen(port, () => start());
