@@ -33,6 +33,13 @@ let globalContractSize = 0.0001;
 let activePosition = null;
 let tp1Reached = false;
 
+// STABILITY STATES (Fixes the Spamming)
+let lastOrderUpdateTime = 0; 
+const UPDATE_COOLDOWN = 5 * 60 * 1000; // 5 minute minimum stay for orders
+const DRIFT_THRESHOLD = 0.004; // 0.4% price drift before adjusting
+let latestMarketCtx = null;
+let lastOhlcvFetchTime = 0;
+
 let botThinking = {
     trend: 'Analysing...',
     rsi: 0,
@@ -43,12 +50,6 @@ let botThinking = {
     sellTarget: 0,
     lastUpdate: Date.now()
 };
-
-let lastOrderUpdateTime = 0; 
-const UPDATE_COOLDOWN = 3 * 60 * 1000; 
-const DRIFT_THRESHOLD = 0.003; 
-let latestMarketCtx = null;
-let lastOhlcvFetchTime = 0;
 
 // ==========================================
 // UTILS & DATABASE
@@ -90,7 +91,7 @@ async function updateAccountEquity() {
 
 async function getMarketContext() {
     const now = Date.now();
-    if (latestMarketCtx && (now - lastOhlcvFetchTime < 30000)) return latestMarketCtx; 
+    if (latestMarketCtx && (now - lastOhlcvFetchTime < 20000)) return latestMarketCtx; 
 
     const[ohlcv1m, ohlcv5m, ohlcv1h] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1m', undefined, 60),
@@ -109,13 +110,12 @@ async function getMarketContext() {
 
     const recentHigh = Math.max(...highs5m.slice(-lookbackPeriods));
     const recentLow = Math.min(...lows5m.slice(-lookbackPeriods));
-    const rangePercent = ((recentHigh - recentLow) / recentLow) * 100;
 
     let sma1h = ohlcv1h.length >= 200 
         ? SMA.calculate({ period: 200, values: ohlcv1h.map(c => c[4]) }).pop() 
         : SMA.calculate({ period: ohlcv1h.length, values: ohlcv1h.map(c => c[4]) }).pop();
 
-    latestMarketCtx = { rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m, sma1h: sma1h, recentHigh, recentLow, rangePercent };
+    latestMarketCtx = { rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m, sma1h: sma1h, recentHigh, recentLow };
     lastOhlcvFetchTime = now;
     return latestMarketCtx;
 }
@@ -139,7 +139,7 @@ async function runBot() {
         const pos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0);
 
         if (pos) {
-            const side = pos.side.toUpperCase(); // 'LONG' or 'SHORT'
+            const side = pos.side.toUpperCase();
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
             liveMarginUsed = (entry * size * globalContractSize) / leverage;
@@ -154,38 +154,24 @@ async function runBot() {
 
             if (side === 'LONG') {
                 const sl = tp1Reached ? (entry + (entry * 0.001)) : (activePosition.stopPrice - buffer);
-                
-                // TP Logic
                 if (!tp1Reached && currentMarketPrice >= ctx.recentHigh) {
-                    await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 
-                        'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage 
-                    });
+                    await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage });
                     tp1Reached = true;
-                    sendTelegramAlert("🎯 TP HIT: Sold 50% at Structural High. Trailing Entry.");
+                    sendTelegramAlert("🎯 TP HIT: Sold 50% Long.");
                 }
-                // SL Logic
                 if (currentMarketPrice <= sl) {
-                    await mexc.createMarketSellOrder(symbol, size, { 
-                        'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage 
-                    });
+                    await mexc.createMarketSellOrder(symbol, size, { 'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             } else {
                 const sl = tp1Reached ? (entry - (entry * 0.001)) : (activePosition.stopPrice + buffer);
-                
-                // TP Logic
                 if (!tp1Reached && currentMarketPrice <= ctx.recentLow) {
-                    await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 
-                        'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage 
-                    });
+                    await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage });
                     tp1Reached = true;
-                    sendTelegramAlert("🎯 TP HIT: Sold 50% at Structural Low. Trailing Entry.");
+                    sendTelegramAlert("🎯 TP HIT: Sold 50% Short.");
                 }
-                // SL Logic
                 if (currentMarketPrice >= sl) {
-                    await mexc.createMarketBuyOrder(symbol, size, { 
-                        'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage 
-                    });
+                    await mexc.createMarketBuyOrder(symbol, size, { 'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             }
@@ -194,14 +180,15 @@ async function runBot() {
             const openOrders = await mexc.fetchOpenOrders(symbol);
             const now = Date.now();
 
-            const buyPrice = parseFloat(mexc.priceToPrecision(symbol, Math.min(ctx.bbLower, ctx.recentLow)));
-            const sellPrice = parseFloat(mexc.priceToPrecision(symbol, Math.max(ctx.bbUpper, ctx.recentHigh)));
-
             const trendUp = ctx.sma1h ? currentMarketPrice > ctx.sma1h : true;
             const trendDown = ctx.sma1h ? currentMarketPrice < ctx.sma1h : true;
             
-            const allowLong = trendUp || ctx.rsi < 35;
-            const allowShort = trendDown || ctx.rsi > 65;
+            // HYSTERESIS LOGIC: Add buffer to RSI to stop flickering
+            const allowLong = trendUp || ctx.rsi < 32; // Buffer: must drop below 32
+            const allowShort = trendDown || ctx.rsi > 68; // Buffer: must pump above 68
+
+            const buyPrice = parseFloat(mexc.priceToPrecision(symbol, Math.min(ctx.bbLower, ctx.recentLow)));
+            const sellPrice = parseFloat(mexc.priceToPrecision(symbol, Math.max(ctx.bbUpper, ctx.recentHigh)));
 
             botThinking = {
                 trend: trendUp ? 'BULLISH 📈' : 'BEARISH 📉',
@@ -214,10 +201,14 @@ async function runBot() {
             if (openOrders.length === 0) {
                 needsUpdate = true;
             } else {
+                // If a change in side permission occurs (e.g., RSI falls from 70 to 60)
                 const hasLong = openOrders.some(o => o.side === 'buy');
                 const hasShort = openOrders.some(o => o.side === 'sell');
-                if (allowLong !== hasLong || allowShort !== hasShort) needsUpdate = true;
-                if (!needsUpdate && (now - lastOrderUpdateTime > UPDATE_COOLDOWN)) {
+                
+                if (allowLong !== hasLong || allowShort !== hasShort) {
+                    needsUpdate = true;
+                } else if (now - lastOrderUpdateTime > UPDATE_COOLDOWN) {
+                    // Check if price drifted too far from the original limit orders
                     const sampleOrder = openOrders[0];
                     const target = sampleOrder.side === 'buy' ? buyPrice : sellPrice;
                     const drift = Math.abs(parseFloat(sampleOrder.price) - target) / target;
@@ -266,7 +257,7 @@ async function recordExit(side, entry, exit, size, start) {
 }
 
 // ==========================================
-// DASHBOARD UI
+// DASHBOARD
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -276,147 +267,52 @@ app.get('/', async (req, res) => {
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
         const displayEquity = (liveWalletBalance || 0) + (liveMarginUsed || 0) + (liveUnrealizedPnl || 0);
 
-        let posHtml = `
-            <div class="active-card">
-                <div class="card-header">
-                    <h2>🧠 LOGIC MATRIX (HYBRID SNAPSHOT)</h2>
-                    <span style="font-size:11px; color:var(--muted)">REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span>
-                </div>
-                <div class="grid grid-cols-4 gap-4 mt-4">
-                    <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
-                    <div class="stat-box"><span class="label">1M RSI</span><span class="value ${botThinking.rsi > 70 ? 'text-red' : (botThinking.rsi < 30 ? 'text-green' : '')}">${botThinking.rsi}</span></div>
-                    <div class="stat-box"><span class="label">Entry Valid</span><span class="value">L: ${botThinking.allowLong ? '✅' : '❌'} | S: ${botThinking.allowShort ? '✅' : '❌'}</span></div>
-                    <div class="stat-box"><span class="label">Price Hook</span><span class="value" style="font-size:13px">B: $${botThinking.buyTarget} / S: $${botThinking.sellTarget}</span></div>
-                </div>
-            </div>
-        `;
+        let posHtml = `<div class="active-card"><div class="card-header"><h2>🧠 LOGIC MATRIX</h2><span>REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span></div>
+        <div class="grid grid-cols-4 gap-4 mt-4">
+            <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
+            <div class="stat-box"><span class="label">1M RSI</span><span class="value">${botThinking.rsi}</span></div>
+            <div class="stat-box"><span class="label">Entry Valid</span><span class="value">L: ${botThinking.allowLong ? '✅' : '❌'} | S: ${botThinking.allowShort ? '✅' : '❌'}</span></div>
+            <div class="stat-box"><span class="label">Targets</span><span class="value">$${botThinking.buyTarget} / $${botThinking.sellTarget}</span></div>
+        </div></div>`;
 
         if (activePosition) {
-            const notionalSize = activePosition.entryPrice * activePosition.size * globalContractSize;
-            const mode = tp1Reached ? '🎯 RUNNER MODE (SL @ ENTRY)' : '🛡️ PROTECTIVE MODE (SL @ STRUCTURE)';
             const roePct = liveMarginUsed > 0 ? (liveUnrealizedPnl / liveMarginUsed) * 100 : 0;
-
-            posHtml = `
-            <div class="active-card pulse-border">
-                <div class="card-header">
-                    <h2><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE POSITION</h2>
-                    <span class="badge ${activePosition.side === 'LONG' ? 'badge-green' : 'badge-red'}">${activePosition.side}</span>
-                </div>
-                <div class="grid grid-cols-4 gap-4 mt-4">
-                    <div class="stat-box"><span class="label">Entry Price</span><span class="value">$${(activePosition.entryPrice || 0).toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Current Price</span><span class="value">$${(currentMarketPrice || 0).toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Unrealized PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)} (${roePct.toFixed(2)}%)</span></div>
-                    <div class="stat-box"><span class="label">Bot State</span><span class="value text-yellow">${mode}</span></div>
-                    <div class="stat-box"><span class="label">Notional Size</span><span class="value text-blue">$${notionalSize.toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Margin Usage</span><span class="value">$${liveMarginUsed.toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Leverage</span><span class="value">${leverage}x</span></div>
-                    <div class="stat-box"><span class="label">Duration</span><span class="value">${Math.floor((Date.now() - activePosition.startTime)/60000)}m</span></div>
-                </div>
-            </div>`;
+            posHtml = `<div class="active-card pulse-border"><div class="card-header"><h2>ACTIVE ${activePosition.side}</h2></div>
+            <div class="grid grid-cols-4 gap-4 mt-4">
+                <div class="stat-box"><span class="label">Entry</span><span class="value">$${activePosition.entryPrice.toFixed(2)}</span></div>
+                <div class="stat-box"><span class="label">PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${liveUnrealizedPnl.toFixed(2)} (${roePct.toFixed(2)}%)</span></div>
+            </div></div>`;
         }
 
-        res.send(`
-            <!DOCTYPE html>
-            <html lang="en">
-            <head>
-                <title>Elite Sniper V7.7</title>
-                <meta http-equiv="refresh" content="5">
-                <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
-                <style>
-                    :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --yellow: #f59e0b; }
-                    body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; padding: 30px; }
-                    .container { max-width: 1100px; margin: auto; }
-                    h1 { color: #38bdf8; text-align: center; margin-bottom: 5px; font-weight: 800; }
-                    .sub-header { text-align: center; color: var(--muted); margin-bottom: 30px; font-size: 14px; }
-                    .grid { display: grid; } .grid-cols-4 { grid-template-columns: repeat(4, 1fr); } .gap-4 { gap: 15px; } .mt-4 { margin-top: 15px; }
-                    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
-                    .stat-title { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
-                    .stat-value { font-size: 26px; font-weight: 800; display: flex; align-items: baseline; gap: 8px; }
-                    .stat-sub { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 4px; }
-                    .text-green { color: var(--green); } .text-red { color: var(--red); } .text-blue { color: var(--blue); } .text-yellow { color: var(--yellow); }
-                    .active-card { background: #0f172a; padding: 25px; border-radius: 12px; border: 1px solid #0ea5e9; margin-top: 25px; }
-                    .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
-                    .card-header h2 { margin: 0; font-size: 18px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
-                    .badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
-                    .badge-green { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid var(--green); }
-                    .badge-red { background: rgba(239, 68, 68, 0.2); color: var(--red); border: 1px solid var(--red); }
-                    .stat-box { background: var(--card); padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); }
-                    .stat-box .label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
-                    .stat-box .value { display: block; font-size: 16px; font-weight: 600; }
-                    .pulse-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; animation: pulse 1.5s infinite; }
-                    .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
-                    .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
-                    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
-                    table { width: 100%; border-collapse: collapse; margin-top: 15px; background: var(--card); border-radius: 12px; overflow: hidden; }
-                    th { background: #0f172a; color: var(--muted); text-align: left; padding: 16px; font-size: 13px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
-                    td { padding: 16px; font-size: 14px; border-bottom: 1px solid var(--border); font-weight: 600; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>🎯 Elite Sniper V7.7 Terminal</h1>
-                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Trend & RSI Hybrid Logic Active</div>
-                    
-                    <div class="grid grid-cols-4 gap-4">
-                        <div class="card">
-                            <div class="stat-title">Free Balance</div>
-                            <div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div>
-                            <div class="stat-sub">+ Margin Used: $${(liveMarginUsed || 0).toFixed(2)}</div>
-                        </div>
-                        <div class="card">
-                            <div class="stat-title">Real-Time Equity</div>
-                            <div class="stat-value text-blue">$${displayEquity.toFixed(2)}</div>
-                            <div class="stat-sub">Live Account Liquidity</div>
-                        </div>
-                        <div class="card">
-                            <div class="stat-title">Active Unrealized PnL</div>
-                            <div class="stat-value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)}</div>
-                        </div>
-                        <div class="card">
-                            <div class="stat-title">Net Profit / Win Rate</div>
-                            <div class="stat-value ${totalPnlUsd >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd.toFixed(2)}</div>
-                            <div class="stat-sub">Win Rate: ${winRate}%</div>
-                        </div>
-                    </div>
-                    
-                    ${posHtml}
-                    
-                    <h3 style="margin-top:40px; color: var(--muted); font-size: 14px; text-transform: uppercase;">📜 Trade History</h3>
-                    <table>
-                        <tr><th>Closed At (PHT)</th><th>Side</th><th>ROE %</th><th>Net Profit</th><th>Ending Balance</th></tr>
-                        ${recentTrades.map(t => `
-                            <tr>
-                                <td style="color: var(--muted); font-weight: 400;">${formatPHT(t.endTime)}</td>
-                                <td><span class="badge ${t.side === 'LONG' ? 'badge-green' : 'badge-red'}">${t.side}</span></td>
-                                <td class="${(t.pnlPercentage || 0) >= 0 ? 'text-green' : 'text-red'}">${(t.pnlPercentage || 0).toFixed(2)}%</td>
-                                <td class="${(t.pnlUsd || 0) >= 0 ? 'text-green' : 'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
-                                <td>$${(t.equityAfter || 0).toFixed(2)}</td>
-                            </tr>
-                        `).join('')}
-                    </table>
-                </div>
-            </body>
-            </html>
-        `);
-    } catch (e) { res.send(`Dashboard error: ${e.message}`); }
+        res.send(`<!DOCTYPE html><html lang="en"><head><title>Elite Sniper V7.8</title><meta http-equiv="refresh" content="5">
+        <style>:root { --bg: #0b0f19; --card: #1e293b; --text: #f8fafc; --green: #10b981; --red: #ef4444; }
+        body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .card { background: var(--card); padding: 15px; border-radius: 8px; border: 1px solid #334155; }
+        .active-card { background: #0f172a; border: 1px solid #0ea5e9; padding: 20px; margin-top: 20px; border-radius: 8px; }
+        .stat-box { background: #1e293b; padding: 10px; border-radius: 5px; } .label { font-size: 10px; color: #94a3b8; } .value { font-weight: bold; }
+        .text-green { color: var(--green); } .text-red { color: var(--red); }
+        table { width: 100%; margin-top: 20px; border-collapse: collapse; } th, td { padding: 10px; text-align: left; border-bottom: 1px solid #334155; }
+        </style></head><body>
+        <h1>🎯 Elite Sniper V7.8</h1>
+        <div class="grid"><div class="card">Equity: $${displayEquity.toFixed(2)}</div><div class="card">Win Rate: ${winRate}%</div><div class="card">Net: $${totalPnlUsd.toFixed(2)}</div><div class="card">Price: $${currentMarketPrice}</div></div>
+        ${posHtml}
+        <table><tr><th>Time (PHT)</th><th>Side</th><th>PnL %</th><th>PnL $</th></tr>
+        ${recentTrades.map(t => `<tr><td>${formatPHT(t.endTime)}</td><td>${t.side}</td><td class="${t.pnlUsd > 0 ? 'text-green' : 'text-red'}">${t.pnlPercentage.toFixed(2)}%</td><td class="${t.pnlUsd > 0 ? 'text-green' : 'text-red'}">$${t.pnlUsd.toFixed(2)}</td></tr>`).join('')}
+        </table></body></html>`);
+    } catch (e) { res.send(`Error: ${e.message}`); }
 });
 
 async function start() {
     try {
         await mexc.loadMarkets();
-        
-        // FIX: Set leverage for both Long (1) and Short (2) for Isolated Margin (1)
-        console.log("Initializing leverage on MEXC...");
         await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
         await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
-        
         await updateAccountEquity();
-        setInterval(runBot, 2500);
+        setInterval(runBot, 3000);
         setInterval(updateAccountEquity, 15000); 
-        console.log("🚀 Bot is live and listening.");
-    } catch (e) {
-        console.error("Startup Error:", e.message);
-    }
+        console.log("🚀 V7.8 Live. Stability Active.");
+    } catch (e) { console.error("Startup Error:", e.message); }
 }
 
 app.listen(port, () => start());
