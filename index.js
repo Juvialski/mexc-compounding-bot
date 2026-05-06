@@ -24,7 +24,8 @@ const mexc = new ccxt.mexc({
 
 // Global States
 let isTrading = false;
-let liveWalletBalance = 0;
+let liveWalletBalance = 0; // CCXT often returns "Available" here for MEXC
+let liveMarginUsed = 0;    // Added to explicitly track locked collateral
 let liveUnrealizedPnl = 0;
 let currentMarketPrice = 0;
 let globalContractSize = 0.0001; 
@@ -69,19 +70,18 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 async function updateAccountEquity() {
     try {
         const balance = await mexc.fetchBalance();
-        // Ensure we capture the pure USDT balance explicitly
+        // For MEXC Swaps, this often maps to the available (free) balance
         liveWalletBalance = balance.total['USDT'] || liveWalletBalance; 
     } catch(e) { console.error("Equity Sync Failed"); }
 }
 
 async function getMarketContext() {
     const now = Date.now();
-    // Only fetch heavy OHLCV data every 30 seconds to save API rate limits
     if (latestMarketCtx && (now - lastOhlcvFetchTime < 30000)) {
         return latestMarketCtx; 
     }
 
-    const [ohlcv1m, ohlcv5m] = await Promise.all([
+    const[ohlcv1m, ohlcv5m] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1m', undefined, 60),
         mexc.fetchOHLCV(symbol, '5m', undefined, 60)
     ]);
@@ -89,15 +89,11 @@ async function getMarketContext() {
     const closes1m = ohlcv1m.map(c => c[4]);
     const closes5m = ohlcv5m.map(c => c[4]);
 
-    // Fast RSI & Wide Bollinger Bands to catch extreme wicks (2.5 StdDev)
     const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
     const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop();
     const atr5m = ATR.calculate({ period: 14, high: ohlcv5m.map(c => c[2]), low: ohlcv5m.map(c => c[3]), close: closes5m }).pop();
 
-    latestMarketCtx = {
-        rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m
-    };
-    
+    latestMarketCtx = { rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m };
     lastOhlcvFetchTime = now;
     return latestMarketCtx;
 }
@@ -124,13 +120,15 @@ async function runBot() {
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
             const pnlUsd = side === 'LONG' ? (currentMarketPrice - entry) * size * globalContractSize : (entry - currentMarketPrice) * size * globalContractSize;
-            const pnlPct = (pnlUsd / ((entry * size * globalContractSize) / leverage)) * 100;
+            
+            // Explicitly track the locked margin
+            liveMarginUsed = (entry * size * globalContractSize) / leverage;
+            const pnlPct = (pnlUsd / liveMarginUsed) * 100;
             
             liveUnrealizedPnl = pnlUsd;
             if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
             activePosition.pnlPct = pnlPct;
 
-            // Clear any lingering fishing orders so we don't accidentally enter a second trade
             const openOrders = await mexc.fetchOpenOrders(symbol);
             if (openOrders.length > 0) {
                 await mexc.cancelAllOrders(symbol);
@@ -165,41 +163,33 @@ async function runBot() {
             }
         } else {
             // === NO POSITION: LIMIT ORDER FISHING MODE ===
-            liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false;
+            liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false; liveMarginUsed = 0;
             
             const stopDist = ctx.atr * 1.5;
-            const contracts = Math.floor((liveWalletBalance * (riskPerTradePercent/100)) / (stopDist * globalContractSize));
+            // Calculate base balance (Available + Margin) to determine total risk allowed
+            const totalBaseEquity = liveWalletBalance + liveMarginUsed;
+            const contracts = Math.floor((totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize));
             
             if (contracts >= 1) {
                 const openOrders = await mexc.fetchOpenOrders(symbol);
                 let needsUpdate = false;
 
-                // Set fishing levels slightly inside the extreme bands
                 const buyTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbLower * 1.0005));
                 const sellTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbUpper * 0.9995));
 
-                if (openOrders.length === 0) {
-                    needsUpdate = true;
-                } else if (openOrders.length === 2) {
-                    // Check if bands have drifted by more than 0.15% to avoid spamming API
+                if (openOrders.length === 0) needsUpdate = true;
+                else if (openOrders.length === 2) {
                     const buyO = openOrders.find(o => o.side === 'buy');
                     const sellO = openOrders.find(o => o.side === 'sell');
                     if (buyO && sellO) {
                         const buyDrift = Math.abs(parseFloat(buyO.price) - buyTrapPrice) / buyTrapPrice;
                         const sellDrift = Math.abs(parseFloat(sellO.price) - sellTrapPrice) / sellTrapPrice;
                         if (buyDrift > 0.0015 || sellDrift > 0.0015) needsUpdate = true;
-                    } else {
-                        needsUpdate = true;
-                    }
-                } else {
-                    // If we somehow have 1 or 3+ orders, clear and reset
-                    needsUpdate = true;
-                }
+                    } else needsUpdate = true;
+                } else needsUpdate = true;
 
                 if (needsUpdate) {
                     if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
-                    
-                    // Place Limit Orders (Zero Slippage, Maker Fees)
                     await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                     await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                     console.log(`🕸️ Traps set: BUY @ ${buyTrapPrice} | SELL @ ${sellTrapPrice}`);
@@ -219,12 +209,12 @@ async function recordExit(side, entry, exit, size, start) {
         pnlPercentage: (netPnl / ((entry * size * globalContractSize) / leverage)) * 100,
         equityAfter: liveWalletBalance, isWin: netPnl > 0, startTime: start, endTime: new Date()
     });
-    activePosition = null; tp1Reached = false;
+    activePosition = null; tp1Reached = false; liveMarginUsed = 0;
     sendTelegramAlert(`💸 TRADE CLOSED: ${side} PnL: $${netPnl.toFixed(2)}`);
 }
 
 // ==========================================
-// DASHBOARD UI (Fixed Equity Calc)
+// DASHBOARD UI (Fixed Total Equity Formula)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -233,13 +223,17 @@ app.get('/', async (req, res) => {
         const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
 
-        // FIXED: Explicitly calculate Display Equity here to ensure it's always accurate on refresh
-        const displayEquity = (liveWalletBalance || 0) + (liveUnrealizedPnl || 0);
+        // =========================================================================
+        // FIXED EQUITY FORMULA: Available Balance + Locked Margin + Unrealized PnL
+        // =========================================================================
+        const displayEquity = (liveWalletBalance || 0) + (liveMarginUsed || 0) + (liveUnrealizedPnl || 0);
 
         let posHtml = `<div class="empty-state">🕸️ FISHING MODE ACTIVE - WAITING FOR A FLASH DIP OR TOP</div>`;
         if (activePosition) {
-            const marginUsed = (activePosition.entryPrice * activePosition.size * globalContractSize) / leverage;
+            const notionalSize = activePosition.entryPrice * activePosition.size * globalContractSize;
             const mode = tp1Reached ? '🎯 BREAK-EVEN (RUNNER)' : '🛡️ INITIAL RISK';
+            const roePct = liveMarginUsed > 0 ? (liveUnrealizedPnl / liveMarginUsed) * 100 : 0;
+
             posHtml = `
             <div class="active-card pulse-border">
                 <div class="card-header">
@@ -249,10 +243,12 @@ app.get('/', async (req, res) => {
                 <div class="grid grid-cols-4 gap-4 mt-4">
                     <div class="stat-box"><span class="label">Entry Price</span><span class="value">$${(activePosition.entryPrice || 0).toFixed(2)}</span></div>
                     <div class="stat-box"><span class="label">Current Price</span><span class="value">$${(currentMarketPrice || 0).toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Unrealized PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">${(activePosition.pnlPct || 0).toFixed(2)}% ($${(liveUnrealizedPnl || 0).toFixed(2)})</span></div>
+                    <div class="stat-box"><span class="label">Unrealized PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)} (${roePct.toFixed(2)}%)</span></div>
                     <div class="stat-box"><span class="label">Bot Mode</span><span class="value text-yellow">${mode}</span></div>
-                    <div class="stat-box"><span class="label">Margin Used</span><span class="value">$${marginUsed.toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Time</span><span class="value">${Math.floor((Date.now() - activePosition.startTime)/60000)}m</span></div>
+                    <div class="stat-box"><span class="label">Position Size (Value)</span><span class="value text-blue">$${notionalSize.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Locked Margin Used</span><span class="value">$${liveMarginUsed.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Leverage</span><span class="value">${leverage}x</span></div>
+                    <div class="stat-box"><span class="label">Time in Trade</span><span class="value">${Math.floor((Date.now() - activePosition.startTime)/60000)}m</span></div>
                 </div>
             </div>`;
         }
@@ -261,7 +257,7 @@ app.get('/', async (req, res) => {
             <!DOCTYPE html>
             <html lang="en">
             <head>
-                <title>Elite Sniper V7.0 (Limit Fishing)</title>
+                <title>Elite Sniper V7.2</title>
                 <meta http-equiv="refresh" content="5">
                 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
                 <style>
@@ -273,12 +269,13 @@ app.get('/', async (req, res) => {
                     .grid { display: grid; } .grid-cols-4 { grid-template-columns: repeat(4, 1fr); } .gap-4 { gap: 15px; } .mt-4 { margin-top: 15px; }
                     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
                     .stat-title { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
-                    .stat-value { font-size: 26px; font-weight: 800; }
+                    .stat-value { font-size: 26px; font-weight: 800; display: flex; align-items: baseline; gap: 8px; }
+                    .stat-sub { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 4px; }
                     .text-green { color: var(--green); } .text-red { color: var(--red); } .text-blue { color: var(--blue); } .text-yellow { color: var(--yellow); }
                     .active-card { background: #0f172a; padding: 25px; border-radius: 12px; border: 1px solid #0ea5e9; margin-top: 25px; }
                     .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
                     .card-header h2 { margin: 0; font-size: 18px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
-                    .badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 800; }
+                    .badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
                     .badge-green { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid var(--green); }
                     .badge-red { background: rgba(239, 68, 68, 0.2); color: var(--red); border: 1px solid var(--red); }
                     .stat-box { background: var(--card); padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); }
@@ -296,19 +293,36 @@ app.get('/', async (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V7.0 Terminal</h1>
-                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Order-Book Fishing Enabled</div>
+                    <h1>🎯 Elite Sniper V7.2 Terminal</h1>
+                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Live Equity Sync Enabled</div>
+                    
                     <div class="grid grid-cols-4 gap-4">
-                        <div class="card"><div class="stat-title">Wallet Balance</div><div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div></div>
-                        <div class="card"><div class="stat-title">Active PnL</div><div class="stat-value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)}</div></div>
-                        <!-- FIXED EQUITY RENDERING -->
-                        <div class="card"><div class="stat-title">Account Equity</div><div class="stat-value text-blue">$${displayEquity.toFixed(2)}</div></div>
-                        <div class="card"><div class="stat-title">Net Profit / Win Rate</div><div class="stat-value ${totalPnlUsd >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd.toFixed(2)} <span style="font-size:14px; color:var(--muted)">(${winRate}%)</span></div></div>
+                        <div class="card">
+                            <div class="stat-title">Available Free Balance</div>
+                            <div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div>
+                            <div class="stat-sub">+ Locked Margin: $${(liveMarginUsed || 0).toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Real-Time Account Equity</div>
+                            <div class="stat-value text-blue">$${displayEquity.toFixed(2)}</div>
+                            <div class="stat-sub">Available + Margin + PnL</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Active PnL</div>
+                            <div class="stat-value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Net Profit / Win Rate</div>
+                            <div class="stat-value ${totalPnlUsd >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd.toFixed(2)}</div>
+                            <div class="stat-sub">Win Rate: ${winRate}%</div>
+                        </div>
                     </div>
+                    
                     ${posHtml}
+                    
                     <h3 style="margin-top:40px; color: var(--muted); font-size: 14px; text-transform: uppercase;">📜 Recent Trade Log</h3>
                     <table>
-                        <tr><th>Closed At (PHT)</th><th>Side</th><th>PnL %</th><th>Net Profit</th><th>Ending Equity</th></tr>
+                        <tr><th>Closed At (PHT)</th><th>Side</th><th>ROE %</th><th>Net Profit</th><th>Ending Balance</th></tr>
                         ${recentTrades.map(t => `
                             <tr>
                                 <td style="color: var(--muted); font-weight: 400;">${formatPHT(t.endTime)}</td>
@@ -329,8 +343,12 @@ app.get('/', async (req, res) => {
 async function start() {
     await mexc.loadMarkets();
     await updateAccountEquity();
-    // Fast Polling loop (every 2.5 seconds). Generous enough to not hit rate limits, fast enough to react.
+    
+    // Fast Polling loop (every 2.5 seconds) for price updates
     setInterval(runBot, 2500);
+    
+    // Background loop to keep your Account Balance synced every 15 seconds
+    setInterval(updateAccountEquity, 15000); 
 }
 
 app.listen(port, () => start());
