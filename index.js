@@ -14,7 +14,7 @@ const symbol = 'BTC/USDT:USDT';
 const leverage = 10;
 const riskPerTradePercent = 2.5; 
 const takerFeeRate = 0.0006; 
-const lookbackPeriods = 30; // 30 candles on 5m = 2.5 hours of structure
+const lookbackPeriods = 30; 
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -33,7 +33,6 @@ let globalContractSize = 0.0001;
 let activePosition = null;
 let tp1Reached = false;
 
-// Thinking State (For Dashboard Visualization)
 let botThinking = {
     trend: 'Analysing...',
     rsi: 0,
@@ -45,12 +44,9 @@ let botThinking = {
     lastUpdate: Date.now()
 };
 
-// Stability States
 let lastOrderUpdateTime = 0; 
 const UPDATE_COOLDOWN = 3 * 60 * 1000; 
 const DRIFT_THRESHOLD = 0.003; 
-
-// Optimization States
 let latestMarketCtx = null;
 let lastOhlcvFetchTime = 0;
 
@@ -143,7 +139,7 @@ async function runBot() {
         const pos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0);
 
         if (pos) {
-            const side = pos.side.toUpperCase();
+            const side = pos.side.toUpperCase(); // 'LONG' or 'SHORT'
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
             liveMarginUsed = (entry * size * globalContractSize) / leverage;
@@ -158,24 +154,38 @@ async function runBot() {
 
             if (side === 'LONG') {
                 const sl = tp1Reached ? (entry + (entry * 0.001)) : (activePosition.stopPrice - buffer);
+                
+                // TP Logic
                 if (!tp1Reached && currentMarketPrice >= ctx.recentHigh) {
-                    await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
+                    await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 
+                        'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage 
+                    });
                     tp1Reached = true;
                     sendTelegramAlert("🎯 TP HIT: Sold 50% at Structural High. Trailing Entry.");
                 }
+                // SL Logic
                 if (currentMarketPrice <= sl) {
-                    await mexc.createMarketSellOrder(symbol, size, { 'reduceOnly': true });
+                    await mexc.createMarketSellOrder(symbol, size, { 
+                        'reduceOnly': true, 'openType': 1, 'positionType': 1, 'leverage': leverage 
+                    });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             } else {
                 const sl = tp1Reached ? (entry - (entry * 0.001)) : (activePosition.stopPrice + buffer);
+                
+                // TP Logic
                 if (!tp1Reached && currentMarketPrice <= ctx.recentLow) {
-                    await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
+                    await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 
+                        'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage 
+                    });
                     tp1Reached = true;
                     sendTelegramAlert("🎯 TP HIT: Sold 50% at Structural Low. Trailing Entry.");
                 }
+                // SL Logic
                 if (currentMarketPrice >= sl) {
-                    await mexc.createMarketBuyOrder(symbol, size, { 'reduceOnly': true });
+                    await mexc.createMarketBuyOrder(symbol, size, { 
+                        'reduceOnly': true, 'openType': 1, 'positionType': 2, 'leverage': leverage 
+                    });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             }
@@ -197,11 +207,7 @@ async function runBot() {
                 trend: trendUp ? 'BULLISH 📈' : 'BEARISH 📉',
                 rsi: ctx.rsi.toFixed(1),
                 bbStatus: currentMarketPrice > ctx.bbUpper ? 'Overbought' : (currentMarketPrice < ctx.bbLower ? 'Oversold' : 'Neutral'),
-                allowLong,
-                allowShort,
-                buyTarget: buyPrice,
-                sellTarget: sellPrice,
-                lastUpdate: now
+                allowLong, allowShort, buyTarget: buyPrice, sellTarget: sellPrice, lastUpdate: now
             };
 
             let needsUpdate = false;
@@ -231,7 +237,6 @@ async function runBot() {
                 const q2 = parseFloat(mexc.amountToPrecision(symbol, qty * 0.4));
 
                 if (q1 > 0) {
-                    // FIX: Added 'leverage': leverage to params for Isolated Margin (openType: 1)
                     if (allowLong) {
                         await mexc.createOrder(symbol, 'limit', 'buy', q1, buyPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                         await mexc.createOrder(symbol, 'limit', 'buy', q2, buyPrice * 0.998, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
@@ -399,11 +404,16 @@ app.get('/', async (req, res) => {
 async function start() {
     try {
         await mexc.loadMarkets();
-        // ENSURE LEVERAGE IS SET ON STARTUP
-        await mexc.setLeverage(leverage, symbol);
+        
+        // FIX: Set leverage for both Long (1) and Short (2) for Isolated Margin (1)
+        console.log("Initializing leverage on MEXC...");
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
+        await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
+        
         await updateAccountEquity();
         setInterval(runBot, 2500);
         setInterval(updateAccountEquity, 15000); 
+        console.log("🚀 Bot is live and listening.");
     } catch (e) {
         console.error("Startup Error:", e.message);
     }
