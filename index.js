@@ -2,7 +2,7 @@ const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
 const https = require('https');
-const { RSI, SMA, ATR, MACD } = require('technicalindicators');
+const { RSI, SMA, ATR, MACD, BollingerBands } = require('technicalindicators');
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -24,13 +24,16 @@ const mexc = new ccxt.mexc({
 
 // Global States
 let isTrading = false;
-let liveTotalEquity = 0; 
 let liveWalletBalance = 0;
 let liveUnrealizedPnl = 0;
 let currentMarketPrice = 0;
 let globalContractSize = 0.0001; 
 let activePosition = null;
 let tp1Reached = false;
+
+// Optimization States
+let latestMarketCtx = null;
+let lastOhlcvFetchTime = 0;
 
 // ==========================================
 // UTILS & DATABASE
@@ -66,97 +69,140 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 async function updateAccountEquity() {
     try {
         const balance = await mexc.fetchBalance();
-        liveWalletBalance = balance.total['USDT'] || 0; 
+        // Ensure we capture the pure USDT balance explicitly
+        liveWalletBalance = balance.total['USDT'] || liveWalletBalance; 
     } catch(e) { console.error("Equity Sync Failed"); }
 }
 
 async function getMarketContext() {
-    const [ohlcv1h, ohlcv15m, ohlcv5m] = await Promise.all([
-        mexc.fetchOHLCV(symbol, '1h', undefined, 60),
-        mexc.fetchOHLCV(symbol, '15m', undefined, 60),
+    const now = Date.now();
+    // Only fetch heavy OHLCV data every 30 seconds to save API rate limits
+    if (latestMarketCtx && (now - lastOhlcvFetchTime < 30000)) {
+        return latestMarketCtx; 
+    }
+
+    const [ohlcv1m, ohlcv5m] = await Promise.all([
+        mexc.fetchOHLCV(symbol, '1m', undefined, 60),
         mexc.fetchOHLCV(symbol, '5m', undefined, 60)
     ]);
-    const closes1h = ohlcv1h.map(c => c[4]);
-    const closes15m = ohlcv15m.map(c => c[4]);
+    
+    const closes1m = ohlcv1m.map(c => c[4]);
     const closes5m = ohlcv5m.map(c => c[4]);
-    currentMarketPrice = closes5m[closes5m.length - 1];
 
-    const sma50_1h = SMA.calculate({ period: 50, values: closes1h }).pop();
-    const rsi15m = RSI.calculate({ period: 14, values: closes15m }).pop();
-    const macd5m = MACD.calculate({ values: closes5m, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 }).pop();
-    const atr15m = ATR.calculate({ period: 14, high: ohlcv15m.map(c => c[2]), low: ohlcv15m.map(c => c[3]), close: closes15m }).pop();
-    const avgVol = ohlcv5m.slice(-10).reduce((a, b) => a + b[5], 0) / 10;
+    // Fast RSI & Wide Bollinger Bands to catch extreme wicks (2.5 StdDev)
+    const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
+    const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop();
+    const atr5m = ATR.calculate({ period: 14, high: ohlcv5m.map(c => c[2]), low: ohlcv5m.map(c => c[3]), close: closes5m }).pop();
 
-    return { 
-        price: currentMarketPrice, trend1h: currentMarketPrice > sma50_1h ? 'BULL' : 'BEAR',
-        rsi: rsi15m, macd: macd5m, atr: atr15m, volumeHigh: ohlcv5m[ohlcv5m.length-1][5] > avgVol
+    latestMarketCtx = {
+        rsi: rsi1m, bbUpper: bb1m.upper, bbLower: bb1m.lower, atr: atr5m
     };
+    
+    lastOhlcvFetchTime = now;
+    return latestMarketCtx;
 }
 
 async function runBot() {
     if (isTrading) return; 
     isTrading = true;
     try {
-        await updateAccountEquity();
+        const ticker = await mexc.fetchTicker(symbol);
+        currentMarketPrice = ticker.last;
+
         const ctx = await getMarketContext();
-        const market = await mexc.market(symbol);
-        globalContractSize = market.contractSize;
+        if (globalContractSize === 0.0001) {
+            const market = await mexc.market(symbol);
+            globalContractSize = market.contractSize;
+        }
 
         const positions = await mexc.fetchPositions([symbol]);
         const pos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0);
 
         if (pos) {
+            // === POSITION MANAGEMENT MODE ===
             const side = pos.side.toUpperCase();
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
-            const pnlUsd = side === 'LONG' ? (ctx.price - entry) * size * globalContractSize : (entry - ctx.price) * size * globalContractSize;
+            const pnlUsd = side === 'LONG' ? (currentMarketPrice - entry) * size * globalContractSize : (entry - currentMarketPrice) * size * globalContractSize;
             const pnlPct = (pnlUsd / ((entry * size * globalContractSize) / leverage)) * 100;
             
             liveUnrealizedPnl = pnlUsd;
-            liveTotalEquity = liveWalletBalance + pnlUsd;
             if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
             activePosition.pnlPct = pnlPct;
 
-            const stopDist = ctx.atr * 2.5; 
-            const tpDist = stopDist * 1.5;
+            // Clear any lingering fishing orders so we don't accidentally enter a second trade
+            const openOrders = await mexc.fetchOpenOrders(symbol);
+            if (openOrders.length > 0) {
+                await mexc.cancelAllOrders(symbol);
+                console.log("🧹 Traps cleared. Transitioned to active position management.");
+            }
+
+            const stopDist = ctx.atr * 1.5; 
+            const tpDist = stopDist * 2.0;
 
             if (side === 'LONG') {
                 const sl = tp1Reached ? (entry + (entry * 0.001)) : (entry - stopDist);
-                if (!tp1Reached && ctx.price >= (entry + tpDist)) {
+                if (!tp1Reached && currentMarketPrice >= (entry + tpDist)) {
                     await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
                     tp1Reached = true;
                     sendTelegramAlert("🎯 TP1 HIT: Sold 50%, SL moved to entry.");
                 }
-                if (ctx.price <= sl || (tp1Reached && ctx.macd.histogram < 0)) {
+                if (currentMarketPrice <= sl) {
                     await mexc.createMarketSellOrder(symbol, size, { 'reduceOnly': true });
-                    await recordExit(side, entry, ctx.price, size, activePosition.startTime);
+                    await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             } else {
                 const sl = tp1Reached ? (entry - (entry * 0.001)) : (entry + stopDist);
-                if (!tp1Reached && ctx.price <= (entry - tpDist)) {
+                if (!tp1Reached && currentMarketPrice <= (entry - tpDist)) {
                     await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
                     tp1Reached = true;
                     sendTelegramAlert("🎯 TP1 HIT: Sold 50%, SL moved to entry.");
                 }
-                if (ctx.price >= sl || (tp1Reached && ctx.macd.histogram > 0)) {
+                if (currentMarketPrice >= sl) {
                     await mexc.createMarketBuyOrder(symbol, size, { 'reduceOnly': true });
-                    await recordExit(side, entry, ctx.price, size, activePosition.startTime);
+                    await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
                 }
             }
         } else {
-            liveUnrealizedPnl = 0; liveTotalEquity = liveWalletBalance; activePosition = null; tp1Reached = false;
+            // === NO POSITION: LIMIT ORDER FISHING MODE ===
+            liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false;
             
-            const isLong = ctx.trend1h === 'BULL' && ctx.rsi < 60 && ctx.macd.histogram > 0 && ctx.volumeHigh;
-            const isShort = ctx.trend1h === 'BEAR' && ctx.rsi > 40 && ctx.macd.histogram < 0 && ctx.volumeHigh;
+            const stopDist = ctx.atr * 1.5;
+            const contracts = Math.floor((liveWalletBalance * (riskPerTradePercent/100)) / (stopDist * globalContractSize));
+            
+            if (contracts >= 1) {
+                const openOrders = await mexc.fetchOpenOrders(symbol);
+                let needsUpdate = false;
 
-            if (isLong || isShort) {
-                const stopDist = ctx.atr * 2.5;
-                const contracts = Math.floor((liveWalletBalance * (riskPerTradePercent/100)) / (stopDist * globalContractSize));
-                if (contracts >= 1) {
-                    const side = isLong ? 'buy' : 'sell';
-                    const type = isLong ? 1 : 2;
-                    await mexc.createMarketOrder(symbol, side, contracts, undefined, { 'openType': 1, 'positionType': type, 'leverage': leverage });
-                    sendTelegramAlert(`🚀 ${side.toUpperCase()} ENTRY at ${ctx.price}`);
+                // Set fishing levels slightly inside the extreme bands
+                const buyTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbLower * 1.0005));
+                const sellTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbUpper * 0.9995));
+
+                if (openOrders.length === 0) {
+                    needsUpdate = true;
+                } else if (openOrders.length === 2) {
+                    // Check if bands have drifted by more than 0.15% to avoid spamming API
+                    const buyO = openOrders.find(o => o.side === 'buy');
+                    const sellO = openOrders.find(o => o.side === 'sell');
+                    if (buyO && sellO) {
+                        const buyDrift = Math.abs(parseFloat(buyO.price) - buyTrapPrice) / buyTrapPrice;
+                        const sellDrift = Math.abs(parseFloat(sellO.price) - sellTrapPrice) / sellTrapPrice;
+                        if (buyDrift > 0.0015 || sellDrift > 0.0015) needsUpdate = true;
+                    } else {
+                        needsUpdate = true;
+                    }
+                } else {
+                    // If we somehow have 1 or 3+ orders, clear and reset
+                    needsUpdate = true;
+                }
+
+                if (needsUpdate) {
+                    if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
+                    
+                    // Place Limit Orders (Zero Slippage, Maker Fees)
+                    await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                    await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                    console.log(`🕸️ Traps set: BUY @ ${buyTrapPrice} | SELL @ ${sellTrapPrice}`);
                 }
             }
         }
@@ -174,10 +220,11 @@ async function recordExit(side, entry, exit, size, start) {
         equityAfter: liveWalletBalance, isWin: netPnl > 0, startTime: start, endTime: new Date()
     });
     activePosition = null; tp1Reached = false;
+    sendTelegramAlert(`💸 TRADE CLOSED: ${side} PnL: $${netPnl.toFixed(2)}`);
 }
 
 // ==========================================
-// ORIGINAL DASHBOARD UI
+// DASHBOARD UI (Fixed Equity Calc)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -186,7 +233,10 @@ app.get('/', async (req, res) => {
         const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
 
-        let posHtml = `<div class="empty-state">⚪ NO ACTIVE POSITIONS - SCANNING MARKET</div>`;
+        // FIXED: Explicitly calculate Display Equity here to ensure it's always accurate on refresh
+        const displayEquity = (liveWalletBalance || 0) + (liveUnrealizedPnl || 0);
+
+        let posHtml = `<div class="empty-state">🕸️ FISHING MODE ACTIVE - WAITING FOR A FLASH DIP OR TOP</div>`;
         if (activePosition) {
             const marginUsed = (activePosition.entryPrice * activePosition.size * globalContractSize) / leverage;
             const mode = tp1Reached ? '🎯 BREAK-EVEN (RUNNER)' : '🛡️ INITIAL RISK';
@@ -211,8 +261,8 @@ app.get('/', async (req, res) => {
             <!DOCTYPE html>
             <html lang="en">
             <head>
-                <title>Elite Sniper V6.0</title>
-                <meta http-equiv="refresh" content="8">
+                <title>Elite Sniper V7.0 (Limit Fishing)</title>
+                <meta http-equiv="refresh" content="5">
                 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
                 <style>
                     :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --yellow: #f59e0b; }
@@ -234,7 +284,7 @@ app.get('/', async (req, res) => {
                     .stat-box { background: var(--card); padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); }
                     .stat-box .label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
                     .stat-box .value { display: block; font-size: 16px; font-weight: 600; }
-                    .empty-state { margin-top: 25px; padding: 40px; border: 1px dashed var(--border); color: var(--muted); border-radius: 12px; text-align: center; background: rgba(30, 41, 59, 0.3); }
+                    .empty-state { margin-top: 25px; padding: 40px; border: 1px dashed var(--border); color: var(--muted); border-radius: 12px; text-align: center; background: rgba(30, 41, 59, 0.3); font-weight: 600;}
                     .pulse-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; animation: pulse 1.5s infinite; }
                     .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
                     .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
@@ -246,12 +296,13 @@ app.get('/', async (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V6.0 Terminal</h1>
-                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())}</div>
+                    <h1>🎯 Elite Sniper V7.0 Terminal</h1>
+                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Order-Book Fishing Enabled</div>
                     <div class="grid grid-cols-4 gap-4">
                         <div class="card"><div class="stat-title">Wallet Balance</div><div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div></div>
                         <div class="card"><div class="stat-title">Active PnL</div><div class="stat-value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)}</div></div>
-                        <div class="card"><div class="stat-title">Account Equity</div><div class="stat-value text-blue">$${(liveTotalEquity || 0).toFixed(2)}</div></div>
+                        <!-- FIXED EQUITY RENDERING -->
+                        <div class="card"><div class="stat-title">Account Equity</div><div class="stat-value text-blue">$${displayEquity.toFixed(2)}</div></div>
                         <div class="card"><div class="stat-title">Net Profit / Win Rate</div><div class="stat-value ${totalPnlUsd >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd.toFixed(2)} <span style="font-size:14px; color:var(--muted)">(${winRate}%)</span></div></div>
                     </div>
                     ${posHtml}
@@ -277,6 +328,9 @@ app.get('/', async (req, res) => {
 
 async function start() {
     await mexc.loadMarkets();
-    setInterval(runBot, 10000);
+    await updateAccountEquity();
+    // Fast Polling loop (every 2.5 seconds). Generous enough to not hit rate limits, fast enough to react.
+    setInterval(runBot, 2500);
 }
+
 app.listen(port, () => start());
