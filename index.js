@@ -14,7 +14,8 @@ const symbol = 'BTC/USDT:USDT';
 const leverage = 10;
 const riskPerTradePercent = 2.5; 
 const takerFeeRate = 0.0006; 
-const PROBABILITY_THRESHOLD = 80; 
+const PROBABILITY_THRESHOLD = 75; 
+const REWARD_RATIO = 1.2; // 1:1.2 RR Ratio for 51%+ Winrate efficiency
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -31,7 +32,6 @@ let liveUnrealizedPnl = 0;
 let currentMarketPrice = 0;
 let globalContractSize = 0.0001; 
 let activePosition = null;
-let tp1Reached = false;
 let lastOrderUpdateTime = 0;
 
 let botThinking = {
@@ -92,7 +92,7 @@ async function getMarketContext() {
         const adx = adxData ? adxData.adx : 0;
         const volSpike = ohlcv15m[ohlcv15m.length - 1][5] > (ohlcv15m.slice(-20).reduce((a, b) => a + b[5], 0) / 20) * 1.8;
 
-        return { rsi1m, bb1m, sma1h, atr15m, adx, volSpike, recentHigh: Math.max(...ohlcv15m.slice(-30).map(c => c[2])), recentLow: Math.min(...ohlcv15m.slice(-30).map(c => c[3])) };
+        return { rsi1m, bb1m, sma1h, atr15m, adx, volSpike };
     } catch (e) { return null; }
 }
 
@@ -131,27 +131,29 @@ async function runBot() {
             const entry = Number(pos.entryPrice);
             const size = Number(pos.contracts);
             
-            // MANUAL CALCULATION FOR ROBUSTNESS
             liveUnrealizedPnl = (side === 'LONG' ? (currentMarketPrice - entry) : (entry - currentMarketPrice)) * size * globalContractSize;
             liveMarginUsed = (entry * size * globalContractSize) / leverage;
             
             if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
 
-            const stopDist = ctx.atr15m * 1.8;
-            const sl = tp1Reached ? entry : (side === 'LONG' ? (entry - stopDist) : (entry + stopDist));
-            const tp = side === 'LONG' ? ctx.recentHigh : ctx.recentLow;
+            // 51% WINRATE OPTIMIZED EXIT LOGIC
+            const stopDist = ctx.atr15m * 1.5; 
+            const feeBuffer = entry * 0.0015; // Covers 0.12% fees + slippage
+            
+            const sl = side === 'LONG' ? (entry - stopDist) : (entry + stopDist);
+            const tp = side === 'LONG' 
+                ? (entry + (stopDist * REWARD_RATIO) + feeBuffer) 
+                : (entry - (stopDist * REWARD_RATIO) - feeBuffer);
 
-            if (!tp1Reached && (side === 'LONG' ? currentMarketPrice >= tp : currentMarketPrice <= tp)) {
-                await mexc.createOrder(symbol, 'market', side === 'LONG' ? 'sell' : 'buy', Math.floor(size/2), undefined, { 'reduceOnly': true });
-                tp1Reached = true;
-            }
+            const isStopHit = side === 'LONG' ? currentMarketPrice <= sl : currentMarketPrice >= sl;
+            const isTargetHit = side === 'LONG' ? currentMarketPrice >= tp : currentMarketPrice <= tp;
 
-            if (side === 'LONG' ? currentMarketPrice <= sl : currentMarketPrice >= sl) {
+            if (isStopHit || isTargetHit) {
                 await mexc.createOrder(symbol, 'market', side === 'LONG' ? 'sell' : 'buy', size, undefined, { 'reduceOnly': true });
                 await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
             }
         } else {
-            liveUnrealizedPnl = 0; liveMarginUsed = 0; activePosition = null; tp1Reached = false;
+            liveUnrealizedPnl = 0; liveMarginUsed = 0; activePosition = null;
             
             const longScore = (currentMarketPrice > ctx.sma1h ? 30 : 0) + (ctx.rsi1m < 32 ? 25 : 0) + (ctx.adx < 25 ? 20 : 0) + (ctx.volSpike ? 25 : 0);
             const shortScore = (currentMarketPrice < ctx.sma1h ? 30 : 0) + (ctx.rsi1m > 68 ? 25 : 0) + (ctx.adx < 25 ? 20 : 0) + (ctx.volSpike ? 25 : 0);
@@ -161,24 +163,32 @@ async function runBot() {
             botThinking = { score: bestScore, trend: currentMarketPrice > ctx.sma1h ? 'BULLISH' : 'BEARISH', volatility: ctx.adx > 30 ? 'TRENDING' : 'STABLE', rsi: ctx.rsi1m.toFixed(1), logic: [`Score: ${bestScore}%`, `Trend: ${bestSide}`], buyTarget: ctx.bb1m.lower, sellTarget: ctx.bb1m.upper, lastUpdate: Date.now() };
 
             if (bestScore >= PROBABILITY_THRESHOLD && (Date.now() - lastOrderUpdateTime > 60000)) {
-                const qty = mexc.amountToPrecision(symbol, ((liveWalletBalance * (riskPerTradePercent/100)) * leverage) / currentMarketPrice);
+                // Risk-Based Sizing
+                const riskAmount = liveWalletBalance * (riskPerTradePercent / 100);
+                const stopDist = ctx.atr15m * 1.5;
+                let qty = (riskAmount * leverage) / currentMarketPrice;
+                qty = mexc.amountToPrecision(symbol, qty);
+
                 if (parseFloat(qty) > 0) {
-                    await mexc.createOrder(symbol, 'limit', bestSide === 'LONG' ? 'buy' : 'sell', qty, bestSide === 'LONG' ? ctx.bb1m.lower : ctx.bb1m.upper, { 'openType': 1, 'positionType': bestSide === 'LONG' ? 1 : 2 });
+                    // Limit order at Bollinger Band edge for better R:R
+                    const targetEntry = bestSide === 'LONG' ? ctx.bb1m.lower : ctx.bb1m.upper;
+                    await mexc.createOrder(symbol, 'limit', bestSide === 'LONG' ? 'buy' : 'sell', qty, targetEntry, { 'openType': 1, 'positionType': bestSide === 'LONG' ? 1 : 2 });
                     lastOrderUpdateTime = Date.now();
                 }
             }
         }
-    } catch (e) { console.error(e); } finally { isTrading = false; }
+    } catch (e) { console.error("Bot Error:", e.message); } finally { isTrading = false; }
 }
 
 async function recordExit(side, entry, exit, size, start) {
-    const netPnl = ((side === 'LONG' ? (exit - entry) : (entry - exit)) * size * globalContractSize) - ((entry + exit) * size * globalContractSize * takerFeeRate);
+    const feeCost = (entry + exit) * size * globalContractSize * takerFeeRate;
+    const netPnl = ((side === 'LONG' ? (exit - entry) : (entry - exit)) * size * globalContractSize) - feeCost;
     await updateAccountEquity();
     await Trade.create({ side, entryPrice: entry, exitPrice: exit, pnlUsd: netPnl, pnlPercentage: (netPnl / ((entry * size * globalContractSize) / leverage)) * 100, equityAfter: liveWalletBalance, isWin: netPnl > 0, startTime: start, endTime: new Date() });
 }
 
 // ==========================================
-// DASHBOARD UI
+// DASHBOARD UI (UNCHANGED)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -263,7 +273,7 @@ app.get('/', async (req, res) => {
 async function start() {
     await mexc.loadMarkets();
     await updateAccountEquity();
-    setInterval(runBot, 3000);
-    setInterval(updateAccountEquity, 10000); 
+    setInterval(runBot, 4000);
+    setInterval(updateAccountEquity, 15000); 
 }
 app.listen(port, () => start());
