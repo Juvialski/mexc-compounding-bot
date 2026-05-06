@@ -81,7 +81,7 @@ async function getMarketContext() {
         return latestMarketCtx; 
     }
 
-    // 🛠️ OPTIMIZATION: Added 1H OHLCV fetch for the Trend Filter (200 SMA)
+    // Fetch 1H OHLCV for Trend Filter
     const[ohlcv1m, ohlcv5m, ohlcv1h] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1m', undefined, 60),
         mexc.fetchOHLCV(symbol, '5m', undefined, 60),
@@ -96,7 +96,7 @@ async function getMarketContext() {
     const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop();
     const atr5m = ATR.calculate({ period: 14, high: ohlcv5m.map(c => c[2]), low: ohlcv5m.map(c => c[3]), close: closes5m }).pop();
 
-    // 🛠️ OPTIMIZATION: Calculate 200 SMA (Fallback to smaller SMA if less than 200 candles exist)
+    // Calculate 200 SMA (Fallback to smaller SMA if less than 200 candles exist)
     let sma1h = null;
     if (closes1h.length >= 200) {
         sma1h = SMA.calculate({ period: 200, values: closes1h }).pop();
@@ -119,7 +119,6 @@ async function runBot() {
     if (isTrading) return; 
     isTrading = true;
     try {
-        // 🛠️ OPTIMIZATION: Grouped API calls using Promise.all to save latency
         const [ticker, positions] = await Promise.all([
             mexc.fetchTicker(symbol),
             mexc.fetchPositions([symbol])
@@ -147,7 +146,7 @@ async function runBot() {
             
             liveUnrealizedPnl = pnlUsd;
 
-            // 🛠️ FIX: Added initialAtr to lock in the Stop Loss distance at the start of the trade
+            // Lock in the initial ATR for Stop Loss calculation to prevent drift
             if(!activePosition) {
                 activePosition = { side, entryPrice: entry, startTime: Date.now(), size, initialAtr: ctx.atr };
             } else if (!activePosition.initialAtr) {
@@ -161,7 +160,6 @@ async function runBot() {
                 console.log("🧹 Traps cleared. Transitioned to active position management.");
             }
 
-            // 🛠️ FIX: Stop Loss now relies on the locked initial ATR, preventing it from drifting!
             const stopDist = activePosition.initialAtr * 1.5; 
             const tpDist = stopDist * 2.0;
 
@@ -193,16 +191,23 @@ async function runBot() {
             liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false; liveMarginUsed = 0;
             
             const stopDist = ctx.atr * 1.5;
-            // Calculate base balance (Available + Margin) to determine total risk allowed
-            const totalBaseEquity = liveWalletBalance + liveMarginUsed;
-            const rawContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize);
             
-            // 🛠️ FIX: Strict precision formatting according to CCXT exchange rules
+            // 1. Calculate target contracts based on 2.5% risk allowance
+            const totalBaseEquity = liveWalletBalance + liveMarginUsed;
+            const targetContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize);
+
+            // 2. Calculate the MAXIMUM contracts we can afford with our current balance & leverage
+            const maxAffordableContracts = (liveWalletBalance * leverage) / (currentMarketPrice * globalContractSize);
+
+            // 3. Margin Cap: Take the smaller of the two (with a 5% buffer for fees/slippage)
+            const rawContracts = Math.min(targetContracts, maxAffordableContracts * 0.95);
+            
+            // 4. Format precision to MEXC exchange rules
             let contracts = 0;
             try {
                 contracts = parseFloat(mexc.amountToPrecision(symbol, rawContracts));
             } catch (e) {
-                contracts = Math.floor(rawContracts); // Fallback if API hasn't synced
+                contracts = Math.floor(rawContracts); 
             }
             
             if (contracts > 0) {
@@ -212,7 +217,7 @@ async function runBot() {
                 const buyTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbLower * 1.0005));
                 const sellTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbUpper * 0.9995));
 
-                // 🛠️ FIX: Trend Filter - Decide which trades are allowed based on 1H SMA
+                // Trend Filter - Decide which trades are allowed based on 1H SMA
                 const allowLong = ctx.sma1h ? currentMarketPrice > ctx.sma1h : true;
                 const allowShort = ctx.sma1h ? currentMarketPrice < ctx.sma1h : true;
 
@@ -241,20 +246,24 @@ async function runBot() {
                 if (needsUpdate) {
                     if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
                     
-                    // 🛠️ FIX: Only set traps in the direction of the 1-Hour Trend
                     if (allowLong) {
                         await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                        console.log(`🕸️ BUY Trap set @ ${buyTrapPrice} (Uptrend)`);
+                        console.log(`🕸️ BUY Trap set @ ${buyTrapPrice} | Contracts: ${contracts}`);
                     }
                     if (allowShort) {
                         await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                        console.log(`🕸️ SELL Trap set @ ${sellTrapPrice} (Downtrend)`);
+                        console.log(`🕸️ SELL Trap set @ ${sellTrapPrice} | Contracts: ${contracts}`);
                     }
                 }
+            } else {
+                console.log(`⚠️ Balance too low to open minimum position size.`);
             }
         }
-    } catch (e) { console.error("Loop Error:", e.message); }
-    finally { isTrading = false; }
+    } catch (e) { 
+        console.error(`Loop Error: ${e.message}`); 
+    } finally { 
+        isTrading = false; 
+    }
 }
 
 async function recordExit(side, entry, exit, size, start) {
