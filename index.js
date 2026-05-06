@@ -33,7 +33,7 @@ let globalContractSize = 0.0001;
 let activePosition = null;
 let tp1Reached = false;
 
-// STABILITY STATES
+// Stability States
 let lastOrderUpdateTime = 0; 
 const UPDATE_COOLDOWN = 5 * 60 * 1000; 
 const DRIFT_THRESHOLD = 0.004; 
@@ -250,7 +250,7 @@ async function recordExit(side, entry, exit, size, start) {
 }
 
 // ==========================================
-// DASHBOARD
+// RESTORED ELITE UI (V7.7 STYLE)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -260,36 +260,128 @@ app.get('/', async (req, res) => {
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
         const displayEquity = (liveWalletBalance || 0) + (liveMarginUsed || 0) + (liveUnrealizedPnl || 0);
 
-        let posHtml = `<div class="active-card"><h3>🧠 LOGIC MATRIX</h3>
-        <div class="grid">
-            <div>Trend: ${botThinking.trend}</div>
-            <div>RSI: ${botThinking.rsi}</div>
-            <div>Valid: L:${botThinking.allowLong?'✅':'❌'} S:${botThinking.allowShort?'✅':'❌'}</div>
-            <div>Targets: $${(botThinking.buyTarget||0).toFixed(1)} / $${(botThinking.sellTarget||0).toFixed(1)}</div>
-        </div></div>`;
+        let posHtml = `
+            <div class="active-card">
+                <div class="card-header">
+                    <h2>🧠 LOGIC MATRIX (HYBRID SNAPSHOT)</h2>
+                    <span style="font-size:11px; color:var(--muted)">REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span>
+                </div>
+                <div class="grid grid-cols-4 gap-4 mt-4">
+                    <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
+                    <div class="stat-box"><span class="label">1M RSI</span><span class="value ${parseFloat(botThinking.rsi) > 65 ? 'text-red' : (parseFloat(botThinking.rsi) < 35 ? 'text-green' : '')}">${botThinking.rsi}</span></div>
+                    <div class="stat-box"><span class="label">Entry Valid</span><span class="value">L: ${botThinking.allowLong ? '✅' : '❌'} | S: ${botThinking.allowShort ? '✅' : '❌'}</span></div>
+                    <div class="stat-box"><span class="label">Price Hook</span><span class="value" style="font-size:13px">B: $${(botThinking.buyTarget || 0).toFixed(1)} / S: $${(botThinking.sellTarget || 0).toFixed(1)}</span></div>
+                </div>
+            </div>
+        `;
 
         if (activePosition) {
+            const notionalSize = activePosition.entryPrice * activePosition.size * globalContractSize;
+            const mode = tp1Reached ? '🎯 RUNNER MODE (SL @ ENTRY)' : '🛡️ PROTECTIVE MODE (SL @ STRUCTURE)';
             const roePct = liveMarginUsed > 0 ? (liveUnrealizedPnl / liveMarginUsed) * 100 : 0;
-            posHtml = `<div class="active-card" style="border-color:#10b981"><h3>ACTIVE: ${activePosition.side}</h3>
-            <div class="grid">
-                <div>Entry: $${(activePosition.entryPrice || 0).toFixed(2)}</div>
-                <div>Unrealized: <span class="${liveUnrealizedPnl>=0?'text-green':'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)} (${(roePct || 0).toFixed(2)}%)</span></div>
-            </div></div>`;
+
+            posHtml = `
+            <div class="active-card pulse-border">
+                <div class="card-header">
+                    <h2><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE POSITION</h2>
+                    <span class="badge ${activePosition.side === 'LONG' ? 'badge-green' : 'badge-red'}">${activePosition.side}</span>
+                </div>
+                <div class="grid grid-cols-4 gap-4 mt-4">
+                    <div class="stat-box"><span class="label">Entry Price</span><span class="value">$${(activePosition.entryPrice || 0).toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Current Price</span><span class="value">$${(currentMarketPrice || 0).toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Unrealized PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)} (${roePct.toFixed(2)}%)</span></div>
+                    <div class="stat-box"><span class="label">Bot State</span><span class="value text-yellow">${mode}</span></div>
+                    <div class="stat-box"><span class="label">Notional Size</span><span class="value text-blue">$${notionalSize.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Margin Usage</span><span class="value">$${liveMarginUsed.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Leverage</span><span class="value">${leverage}x</span></div>
+                    <div class="stat-box"><span class="label">Duration</span><span class="value">${Math.floor((Date.now() - activePosition.startTime)/60000)}m</span></div>
+                </div>
+            </div>`;
         }
 
-        res.send(`<!DOCTYPE html><html><head><title>Elite Sniper V8.0</title><meta http-equiv="refresh" content="5">
-        <style>body{background:#0b0f19;color:#f8fafc;font-family:sans-serif;padding:20px}
-        .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:15px}
-        .card{background:#1e293b;padding:15px;border-radius:8px;border:1px solid #334155}
-        .active-card{background:#0f172a;border:1px solid #0ea5e9;padding:20px;margin:20px 0;border-radius:8px}
-        .text-green{color:#10b981}.text-red{color:#ef4444}
-        table{width:100%;border-collapse:collapse;margin-top:20px}th,td{padding:12px;text-align:left;border-bottom:1px solid #334155}</style></head><body>
-        <h1>🎯 Elite Sniper V8.0</h1>
-        <div class="grid"><div class="card">Equity: $${(displayEquity || 0).toFixed(2)}</div><div class="card">Win Rate: ${winRate}%</div><div class="card">Net: $${(totalPnlUsd || 0).toFixed(2)}</div><div class="card">BTC: $${currentMarketPrice}</div></div>
-        ${posHtml}
-        <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL $</th></tr>
-        ${recentTrades.map(t => `<tr><td>${formatPHT(t.endTime)}</td><td>${t.side}</td><td class="${t.pnlUsd>0?'text-green':'text-red'}">${(t.pnlPercentage||0).toFixed(2)}%</td><td class="${t.pnlUsd>0?'text-green':'text-red'}">$${(t.pnlUsd||0).toFixed(2)}</td></tr>`).join('')}
-        </table></body></html>`);
+        res.send(`
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <title>Elite Sniper V8.1 Terminal</title>
+                <meta http-equiv="refresh" content="5">
+                <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+                <style>
+                    :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --yellow: #f59e0b; }
+                    body { background: var(--bg); color: var(--text); font-family: 'Inter', sans-serif; margin: 0; padding: 30px; }
+                    .container { max-width: 1100px; margin: auto; }
+                    h1 { color: #38bdf8; text-align: center; margin-bottom: 5px; font-weight: 800; }
+                    .sub-header { text-align: center; color: var(--muted); margin-bottom: 30px; font-size: 14px; }
+                    .grid { display: grid; } .grid-cols-4 { grid-template-columns: repeat(4, 1fr); } .gap-4 { gap: 15px; } .mt-4 { margin-top: 15px; }
+                    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+                    .stat-title { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; margin-bottom: 8px; }
+                    .stat-value { font-size: 26px; font-weight: 800; display: flex; align-items: baseline; gap: 8px; }
+                    .stat-sub { font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 4px; }
+                    .text-green { color: var(--green); } .text-red { color: var(--red); } .text-blue { color: var(--blue); } .text-yellow { color: var(--yellow); }
+                    .active-card { background: #0f172a; padding: 25px; border-radius: 12px; border: 1px solid #0ea5e9; margin-top: 25px; }
+                    .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
+                    .card-header h2 { margin: 0; font-size: 18px; color: #38bdf8; display: flex; align-items: center; gap: 10px; }
+                    .badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 800; text-transform: uppercase; }
+                    .badge-green { background: rgba(16, 185, 129, 0.2); color: var(--green); border: 1px solid var(--green); }
+                    .badge-red { background: rgba(239, 68, 68, 0.2); color: var(--red); border: 1px solid var(--red); }
+                    .stat-box { background: var(--card); padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); }
+                    .stat-box .label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
+                    .stat-box .value { display: block; font-size: 16px; font-weight: 600; }
+                    .pulse-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; animation: pulse 1.5s infinite; }
+                    .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+                    .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+                    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+                    table { width: 100%; border-collapse: collapse; margin-top: 15px; background: var(--card); border-radius: 12px; overflow: hidden; }
+                    th { background: #0f172a; color: var(--muted); text-align: left; padding: 16px; font-size: 13px; text-transform: uppercase; border-bottom: 1px solid var(--border); }
+                    td { padding: 16px; font-size: 14px; border-bottom: 1px solid var(--border); font-weight: 600; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🎯 Elite Sniper V8.1 Terminal</h1>
+                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Trend & RSI Hybrid Logic Active</div>
+                    
+                    <div class="grid grid-cols-4 gap-4">
+                        <div class="card">
+                            <div class="stat-title">Free Balance</div>
+                            <div class="stat-value">$${(liveWalletBalance || 0).toFixed(2)}</div>
+                            <div class="stat-sub">+ Margin Used: $${(liveMarginUsed || 0).toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Real-Time Equity</div>
+                            <div class="stat-value text-blue">$${displayEquity.toFixed(2)}</div>
+                            <div class="stat-sub">Live Account Liquidity</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Active Unrealized PnL</div>
+                            <div class="stat-value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${(liveUnrealizedPnl || 0).toFixed(2)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="stat-title">Net Profit / Win Rate</div>
+                            <div class="stat-value ${totalPnlUsd >= 0 ? 'text-green':'text-red'}">$${totalPnlUsd.toFixed(2)}</div>
+                            <div class="stat-sub">Win Rate: ${winRate}%</div>
+                        </div>
+                    </div>
+                    
+                    ${posHtml}
+                    
+                    <h3 style="margin-top:40px; color: var(--muted); font-size: 14px; text-transform: uppercase;">📜 Trade History</h3>
+                    <table>
+                        <tr><th>Closed At (PHT)</th><th>Side</th><th>ROE %</th><th>Net Profit</th><th>Ending Balance</th></tr>
+                        ${recentTrades.map(t => `
+                            <tr>
+                                <td style="color: var(--muted); font-weight: 400;">${formatPHT(t.endTime)}</td>
+                                <td><span class="badge ${t.side === 'LONG' ? 'badge-green' : 'badge-red'}">${t.side}</span></td>
+                                <td class="${(t.pnlPercentage || 0) >= 0 ? 'text-green' : 'text-red'}">${(t.pnlPercentage || 0).toFixed(2)}%</td>
+                                <td class="${(t.pnlUsd || 0) >= 0 ? 'text-green' : 'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
+                                <td>$${(t.equityAfter || 0).toFixed(2)}</td>
+                            </tr>
+                        `).join('')}
+                    </table>
+                </div>
+            </body>
+            </html>
+        `);
     } catch (e) { res.send(`Dashboard error: ${e.message}`); }
 });
 
@@ -297,7 +389,7 @@ async function start() {
     try {
         await mexc.loadMarkets();
         
-        // FIX: Clear existing orders first so leverage can be adjusted
+        // FIX: Clear existing orders first so leverage adjustment is allowed
         console.log("Cleaning up open orders for startup...");
         try {
             await mexc.cancelAllOrders(symbol);
@@ -314,7 +406,7 @@ async function start() {
         await updateAccountEquity();
         setInterval(runBot, 3000);
         setInterval(updateAccountEquity, 15000); 
-        console.log("🚀 V8.0 Startup Fix Active.");
+        console.log("🚀 V8.1 Live with Restored UI.");
     } catch (e) {
         console.error("Fatal Startup Error:", e.message);
     }
