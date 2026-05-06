@@ -23,7 +23,7 @@ const mexc = new ccxt.mexc({
     enableRateLimit: true 
 });
 
-// Global States
+// Global States - Initialized as Numbers to prevent NaN
 let isTrading = false;
 let liveWalletBalance = 0; 
 let liveMarginUsed = 0;    
@@ -74,60 +74,56 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 }));
 
 // ==========================================
-// PROBABILITY ENGINE (V9 LOGIC)
+// PROBABILITY ENGINE
 // ==========================================
 async function getMarketContext() {
-    const [ohlcv1m, ohlcv15m, ohlcv1h] = await Promise.all([
-        mexc.fetchOHLCV(symbol, '1m', undefined, 100),
-        mexc.fetchOHLCV(symbol, '15m', undefined, 100),
-        mexc.fetchOHLCV(symbol, '1h', undefined, 200)
-    ]);
+    try {
+        const [ohlcv1m, ohlcv15m, ohlcv1h] = await Promise.all([
+            mexc.fetchOHLCV(symbol, '1m', undefined, 100),
+            mexc.fetchOHLCV(symbol, '15m', undefined, 100),
+            mexc.fetchOHLCV(symbol, '1h', undefined, 200)
+        ]);
 
-    const closes1m = ohlcv1m.map(c => c[4]);
-    const closes15m = ohlcv15m.map(c => c[4]);
-    const highs15m = ohlcv15m.map(c => c[2]);
-    const lows15m = ohlcv15m.map(c => c[3]);
-    const volumes15m = ohlcv15m.map(c => c[5]);
+        const closes1m = ohlcv1m.map(c => c[4]);
+        const closes15m = ohlcv15m.map(c => c[4]);
+        const highs15m = ohlcv15m.map(c => c[2]);
+        const lows15m = ohlcv15m.map(c => c[3]);
+        const volumes15m = ohlcv15m.map(c => c[5]);
 
-    const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop() || 50;
-    const rsi15m = RSI.calculate({ period: 14, values: closes15m }).pop() || 50;
-    const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop() || { upper: 0, lower: 0 };
-    const sma1h = SMA.calculate({ period: 200, values: ohlcv1h.map(c => c[4]) }).pop() || 0;
-    const atr15m = ATR.calculate({ period: 14, high: highs15m, low: lows15m, close: closes15m }).pop() || 10;
-    
-    const adxData = ADX.calculate({ period: 14, high: highs15m, low: lows15m, close: closes15m }).pop();
-    const adx = adxData ? adxData.adx : 0;
+        const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop() || 50;
+        const rsi15m = RSI.calculate({ period: 14, values: closes15m }).pop() || 50;
+        const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop() || { upper: 0, lower: 0 };
+        const sma1h = SMA.calculate({ period: 200, values: ohlcv1h.map(c => c[4]) }).pop() || 0;
+        const atr15m = ATR.calculate({ period: 14, high: highs15m, low: lows15m, close: closes15m }).pop() || 10;
+        
+        const adxData = ADX.calculate({ period: 14, high: highs15m, low: lows15m, close: closes15m }).pop();
+        const adx = adxData ? adxData.adx : 0;
 
-    const avgVol = volumes15m.slice(-20).reduce((a, b) => a + b, 0) / 20;
-    const currentVol = volumes15m[volumes15m.length - 1];
-    const volSpike = currentVol > avgVol * 1.8;
+        const avgVol = volumes15m.slice(-20).reduce((a, b) => a + b, 0) / 20;
+        const currentVol = volumes15m[volumes15m.length - 1];
+        const volSpike = currentVol > avgVol * 1.8;
 
-    return { 
-        rsi1m, rsi15m, bb1m, sma1h, atr15m, adx, volSpike, 
-        recentHigh: Math.max(...highs15m.slice(-30)), 
-        recentLow: Math.min(...lows15m.slice(-30)) 
-    };
+        return { 
+            rsi1m, rsi15m, bb1m, sma1h, atr15m, adx, volSpike, 
+            recentHigh: Math.max(...highs15m.slice(-30)), 
+            recentLow: Math.min(...lows15m.slice(-30)) 
+        };
+    } catch (e) { return null; }
 }
 
 function calculateProbability(side, ctx, price) {
+    if(!ctx) return { score: 0, logic: ["Data Syncing..."] };
     let score = 0;
     let logic = [];
 
-    if (side === 'LONG' && price > ctx.sma1h) { score += 30; logic.push("🟢 1H Trend Alignment"); }
-    else if (side === 'SHORT' && price < ctx.sma1h) { score += 30; logic.push("🔴 1H Trend Alignment"); }
+    const isBullish = price > ctx.sma1h;
+    if (side === 'LONG' && isBullish) { score += 30; logic.push("🟢 1H Trend Alignment"); }
+    else if (side === 'SHORT' && !isBullish) { score += 30; logic.push("🔴 1H Trend Alignment"); }
 
-    if (ctx.adx < 25) { score += 20; logic.push("⚖️ Low Volatility (Range-Bound)"); }
-    else if (ctx.adx > 35) { score -= 10; logic.push("⚠️ High Trend Strength (Dangerous)"); }
-
-    if (side === 'LONG') {
-        if (ctx.rsi1m < 32) { score += 15; logic.push("📉 1M RSI Oversold"); }
-        if (ctx.rsi15m < 45) { score += 10; logic.push("📊 15M RSI Lower Zone"); }
-    } else {
-        if (ctx.rsi1m > 68) { score += 15; logic.push("📈 1M RSI Overbought"); }
-        if (ctx.rsi15m > 55) { score += 10; logic.push("📊 15M RSI Upper Zone"); }
-    }
-
-    if (ctx.volSpike) { score += 25; logic.push("🔥 Volume Climax detected"); }
+    if (ctx.adx < 25) { score += 20; logic.push("⚖️ Range Environment"); }
+    if (side === 'LONG' && ctx.rsi1m < 32) { score += 25; logic.push("📉 RSI Oversold"); }
+    if (side === 'SHORT' && ctx.rsi1m > 68) { score += 25; logic.push("📈 RSI Overbought"); }
+    if (ctx.volSpike) { score += 25; logic.push("🔥 Volume Climax"); }
 
     return { score, logic };
 }
@@ -138,7 +134,7 @@ function calculateProbability(side, ctx, price) {
 async function updateAccountEquity() {
     try {
         const balance = await mexc.fetchBalance();
-        liveWalletBalance = balance.total['USDT'] || liveWalletBalance; 
+        liveWalletBalance = Number(balance.total['USDT']) || 0; 
     } catch(e) { console.error("Equity Sync Failed"); }
 }
 
@@ -151,8 +147,10 @@ async function runBot() {
             mexc.fetchPositions([symbol]),
             getMarketContext()
         ]);
-        currentMarketPrice = ticker.last;
         
+        currentMarketPrice = Number(ticker.last);
+        if(!ctx) return;
+
         if (globalContractSize === 0.0001) {
             const market = await mexc.market(symbol);
             globalContractSize = market.contractSize || 0.0001;
@@ -162,9 +160,9 @@ async function runBot() {
 
         if (pos) {
             const side = pos.side.toUpperCase();
-            const entry = parseFloat(pos.entryPrice);
-            const size = parseFloat(pos.contracts);
-            liveUnrealizedPnl = parseFloat(pos.unrealizedPnl);
+            const entry = Number(pos.entryPrice);
+            const size = Number(pos.contracts);
+            liveUnrealizedPnl = Number(pos.unrealizedPnl) || 0;
             liveMarginUsed = (entry * size * globalContractSize) / leverage;
             
             if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
@@ -187,38 +185,40 @@ async function runBot() {
                 await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
             }
         } else {
-            liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false; liveMarginUsed = 0;
+            liveUnrealizedPnl = 0; liveMarginUsed = 0; activePosition = null; tp1Reached = false;
+            
             const longEval = calculateProbability('LONG', ctx, currentMarketPrice);
             const shortEval = calculateProbability('SHORT', ctx, currentMarketPrice);
             const bestScore = Math.max(longEval.score, shortEval.score);
             const bestSide = longEval.score > shortEval.score ? 'LONG' : 'SHORT';
-            const bestLogic = longEval.score > shortEval.score ? longEval.logic : shortEval.logic;
 
             botThinking = {
                 score: bestScore,
                 trend: currentMarketPrice > ctx.sma1h ? 'BULLISH 📈' : 'BEARISH 📉',
-                volatility: ctx.adx > 30 ? 'TRENDING (Risky)' : 'STABLE (Optimal)',
+                volatility: ctx.adx > 30 ? 'TRENDING' : 'STABLE',
                 rsi: ctx.rsi1m.toFixed(1),
-                logic: bestLogic,
+                logic: bestSide === 'LONG' ? longEval.logic : shortEval.logic,
                 buyTarget: ctx.bb1m.lower,
                 sellTarget: ctx.bb1m.upper,
                 lastUpdate: Date.now()
             };
 
             if (bestScore >= PROBABILITY_THRESHOLD && (Date.now() - lastOrderUpdateTime > 60000)) {
-                const totalEquity = liveWalletBalance + liveMarginUsed;
-                const qtyUsd = (totalEquity * (riskPerTradePercent/100)) * leverage;
-                const qty = mexc.amountToPrecision(symbol, qtyUsd / currentMarketPrice);
-                const entryPrice = bestSide === 'LONG' ? ctx.bb1m.lower : ctx.bb1m.upper;
+                const openOrders = await mexc.fetchOpenOrders(symbol);
+                if (openOrders.length === 0) {
+                    const qtyUsd = (liveWalletBalance * (riskPerTradePercent/100)) * leverage;
+                    const qty = mexc.amountToPrecision(symbol, qtyUsd / currentMarketPrice);
+                    const entryPrice = bestSide === 'LONG' ? ctx.bb1m.lower : ctx.bb1m.upper;
 
-                if (parseFloat(qty) > 0) {
-                    await mexc.createOrder(symbol, 'limit', bestSide === 'LONG' ? 'buy' : 'sell', qty, entryPrice, { 'openType': 1, 'positionType': bestSide === 'LONG' ? 1 : 2 });
-                    lastOrderUpdateTime = Date.now();
-                    sendTelegramAlert(`⚡ SNIPER SET: ${bestSide} at ${entryPrice} (Prob: ${bestScore}%)`);
+                    if (parseFloat(qty) > 0) {
+                        await mexc.createOrder(symbol, 'limit', bestSide === 'LONG' ? 'buy' : 'sell', qty, entryPrice, { 'openType': 1, 'positionType': bestSide === 'LONG' ? 1 : 2 });
+                        lastOrderUpdateTime = Date.now();
+                        sendTelegramAlert(`⚡ SNIPER SET: ${bestSide} (Prob: ${bestScore}%)`);
+                    }
                 }
             }
         }
-    } catch (e) { console.error(`Loop Error: ${e.message}`); } finally { isTrading = false; }
+    } catch (e) { console.error(`Error: ${e.message}`); } finally { isTrading = false; }
 }
 
 async function recordExit(side, entry, exit, size, start) {
@@ -230,102 +230,110 @@ async function recordExit(side, entry, exit, size, start) {
         pnlPercentage: (netPnl / ((entry * size * globalContractSize) / leverage)) * 100,
         equityAfter: liveWalletBalance, isWin: netPnl > 0, startTime: start, endTime: new Date()
     });
-    activePosition = null; tp1Reached = false; liveMarginUsed = 0;
-    sendTelegramAlert(`💸 TRADE CLOSED: ${side} PnL: $${netPnl.toFixed(2)}`);
 }
 
 // ==========================================
-// DASHBOARD UI (V8.2 STYLE)
+// DASHBOARD UI (V8.2 CYBERPUNK STYLE)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
-        const allTrades = await Trade.find().sort({ endTime: -1 });
-        const recentTrades = allTrades.slice(0, 10);
-        const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
-        const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
-        const displayEquity = liveWalletBalance + liveMarginUsed + liveUnrealizedPnl;
+        const allTrades = await Trade.find().sort({ endTime: -1 }).limit(10);
+        const totalPnlUsd = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
+        const winRate = (await Trade.countDocuments({ isWin: true }) / (await Trade.countDocuments() || 1) * 100).toFixed(1);
+        
+        // FIXING THE NaN MATH
+        const wallet = Number(liveWalletBalance) || 0;
+        const margin = Number(liveMarginUsed) || 0;
+        const pnl = Number(liveUnrealizedPnl) || 0;
+        const displayEquity = wallet + margin + pnl;
 
-        let posHtml = `
+        let mainSection = `
             <div class="active-card">
                 <div class="card-header">
-                    <h2>🧠 PROBABILITY MATRIX (CONFIDENCE: ${botThinking.score}%)</h2>
+                    <h2>🧠 LOGIC MATRIX (CONFIDENCE: ${botThinking.score}%)</h2>
                     <span style="font-size:11px; color:var(--muted)">REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span>
                 </div>
-                <div class="score-bar" style="background:#334155; height:10px; border-radius:5px; margin:15px 0; overflow:hidden;">
-                    <div style="background:#3b82f6; width:${botThinking.score}%; height:100%;"></div>
-                </div>
+                <div class="score-bar"><div class="score-fill" style="width: ${botThinking.score}%"></div></div>
                 <div class="grid grid-cols-4 gap-4 mt-4">
                     <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
-                    <div class="stat-box"><span class="label">Volatility</span><span class="value">${botThinking.volatility}</span></div>
-                    <div class="stat-box"><span class="label">Logic</span><span class="value" style="font-size:10px">${botThinking.logic.join('<br>')}</span></div>
-                    <div class="stat-box"><span class="label">Extreme Targets</span><span class="value" style="font-size:11px">B: $${(botThinking.buyTarget || 0).toFixed(1)}<br>S: $${(botThinking.sellTarget || 0).toFixed(1)}</span></div>
+                    <div class="stat-box"><span class="label">1M RSI</span><span class="value">${botThinking.rsi}</span></div>
+                    <div class="stat-box"><span class="label">Confluences</span><span class="value" style="font-size:10px">${botThinking.logic.join('<br>')}</span></div>
+                    <div class="stat-box"><span class="label">Sniper Hooks</span><span class="value" style="font-size:11px">L: $${(botThinking.buyTarget || 0).toFixed(1)}<br>S: $${(botThinking.sellTarget || 0).toFixed(1)}</span></div>
                 </div>
             </div>
         `;
 
         if (activePosition) {
-            const roePct = liveMarginUsed > 0 ? (liveUnrealizedPnl / liveMarginUsed) * 100 : 0;
-            posHtml = `
-            <div class="active-card" style="border-color:#3b82f6;">
+            const roe = margin > 0 ? (pnl / margin) * 100 : 0;
+            mainSection = `
+            <div class="active-card pulse-border">
                 <div class="card-header">
-                    <h2>ACTIVE POSITION</h2>
-                    <span class="badge" style="background:${activePosition.side === 'LONG'?'#10b981':'#ef4444'}">${activePosition.side}</span>
+                    <h2><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE POSITION</h2>
+                    <span class="badge ${activePosition.side === 'LONG' ? 'badge-green' : 'badge-red'}">${activePosition.side}</span>
                 </div>
                 <div class="grid grid-cols-4 gap-4 mt-4">
-                    <div class="stat-box"><span class="label">Entry</span><span class="value">$${activePosition.entryPrice.toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Market</span><span class="value">$${currentMarketPrice.toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">ROE%</span><span class="value ${roePct >= 0 ? 'text-green' : 'text-red'}">${roePct.toFixed(2)}%</span></div>
-                    <div class="stat-box"><span class="label">PnL</span><span class="value ${liveUnrealizedPnl >= 0 ? 'text-green' : 'text-red'}">$${liveUnrealizedPnl.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Entry Price</span><span class="value">$${activePosition.entryPrice.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">Market Price</span><span class="value">$${currentMarketPrice.toFixed(2)}</span></div>
+                    <div class="stat-box"><span class="label">ROE %</span><span class="value ${roe >= 0 ? 'text-green' : 'text-red'}">${roe.toFixed(2)}%</span></div>
+                    <div class="stat-box"><span class="label">Unrealized PnL</span><span class="value ${pnl >= 0 ? 'text-green' : 'text-red'}">$${pnl.toFixed(2)}</span></div>
                 </div>
             </div>`;
         }
 
         res.send(`
             <!DOCTYPE html>
-            <html lang="en">
+            <html>
             <head>
-                <title>Sniper V9.0 PRO</title>
+                <title>Elite Sniper V9.0 Terminal</title>
                 <meta http-equiv="refresh" content="5">
                 <style>
                     :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; }
                     body { background: var(--bg); color: var(--text); font-family: sans-serif; margin: 0; padding: 30px; }
-                    .container { max-width: 1000px; margin: auto; }
-                    h1 { text-align: center; color: #38bdf8; }
+                    .container { max-width: 1100px; margin: auto; }
+                    h1 { color: #38bdf8; text-align: center; font-weight: 800; margin-bottom: 30px; }
                     .grid { display: grid; } .grid-cols-4 { grid-template-columns: repeat(4, 1fr); } .gap-4 { gap: 15px; } .mt-4 { margin-top: 15px; }
                     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
-                    .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-                    .stat-value { font-size: 22px; font-weight: 800; margin-top: 5px; }
-                    .active-card { background: #0f172a; padding: 20px; border-radius: 12px; border: 1px solid var(--border); margin-top: 20px; }
-                    .card-header { display: flex; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
-                    .stat-box { background: var(--card); padding: 10px; border-radius: 8px; }
-                    .label { font-size: 10px; color: var(--muted); display: block; }
-                    .value { font-size: 14px; font-weight: 600; }
+                    .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; margin-bottom: 8px; }
+                    .stat-value { font-size: 26px; font-weight: 800; }
+                    .active-card { background: #0f172a; padding: 25px; border-radius: 12px; border: 1px solid #0ea5e9; margin-top: 25px; }
+                    .card-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 15px; }
+                    .score-bar { background: #334155; height: 10px; border-radius: 5px; margin-top: 15px; overflow: hidden; }
+                    .score-fill { background: var(--blue); height: 100%; transition: 0.5s; }
+                    .stat-box { background: var(--card); padding: 12px; border-radius: 8px; border: 1px solid var(--border); }
+                    .label { display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; }
+                    .value { display: block; font-size: 16px; font-weight: 600; margin-top: 4px; }
                     .text-green { color: var(--green); } .text-red { color: var(--red); }
-                    table { width: 100%; border-collapse: collapse; margin-top: 25px; }
-                    th { text-align: left; color: var(--muted); font-size: 12px; padding: 10px; border-bottom: 1px solid var(--border); }
-                    td { padding: 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
-                    .badge { padding: 3px 7px; border-radius: 4px; font-size: 10px; color: white; }
+                    .badge { padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 800; }
+                    .badge-green { background: rgba(16, 185, 129, 0.2); color: var(--green); }
+                    .badge-red { background: rgba(239, 68, 68, 0.2); color: var(--red); }
+                    .pulse-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; animation: pulse 1.5s infinite; margin-right: 8px; }
+                    .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
+                    .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
+                    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.4; } 100% { opacity: 1; } }
+                    table { width: 100%; border-collapse: collapse; margin-top: 30px; }
+                    th { text-align: left; color: var(--muted); font-size: 12px; padding: 15px; border-bottom: 1px solid var(--border); }
+                    td { padding: 15px; border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; }
                 </style>
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V9.0 PRO</h1>
+                    <h1>🎯 Elite Sniper V9.0 TERMINAL</h1>
                     <div class="grid grid-cols-4 gap-4">
-                        <div class="card"><div class="stat-title">Balance</div><div class="stat-value">$${liveWalletBalance.toFixed(2)}</div></div>
-                        <div class="card"><div class="stat-title">Equity</div><div class="stat-value" style="color:var(--blue)">$${displayEquity.toFixed(2)}</div></div>
+                        <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${wallet.toFixed(2)}</div></div>
+                        <div class="card"><div class="stat-title">Real-Time Equity</div><div class="stat-value" style="color:var(--blue)">$${displayEquity.toFixed(2)}</div></div>
                         <div class="card"><div class="stat-title">Net Profit</div><div class="stat-value ${totalPnlUsd >= 0 ? 'text-green' : 'text-red'}">$${totalPnlUsd.toFixed(2)}</div></div>
                         <div class="card"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
                     </div>
-                    ${posHtml}
+                    ${mainSection}
                     <table>
-                        <tr><th>Time</th><th>Side</th><th>PnL%</th><th>PnL$</th><th>Equity</th></tr>
-                        ${recentTrades.map(t => `
+                        <tr><th>Time (PHT)</th><th>Side</th><th>PnL %</th><th>PnL USD</th><th>Equity After</th></tr>
+                        ${allTrades.map(t => `
                             <tr>
-                                <td>${formatPHT(t.endTime)}</td>
-                                <td><span class="badge" style="background:${t.side==='LONG'?'#10b981':'#ef4444'}">${t.side}</span></td>
+                                <td style="color:var(--muted)">${formatPHT(t.endTime)}</td>
+                                <td><span class="badge ${t.side === 'LONG'?'badge-green':'badge-red'}">${t.side}</span></td>
                                 <td class="${t.pnlPercentage >= 0 ? 'text-green' : 'text-red'}">${t.pnlPercentage.toFixed(2)}%</td>
                                 <td class="${t.pnlUsd >= 0 ? 'text-green' : 'text-red'}">$${t.pnlUsd.toFixed(2)}</td>
-                                <td>$${t.equityAfter.toFixed(2)}</td>
+                                <td>$${(t.equityAfter || 0).toFixed(2)}</td>
                             </tr>
                         `).join('')}
                     </table>
@@ -339,10 +347,9 @@ app.get('/', async (req, res) => {
 async function start() {
     try {
         await mexc.loadMarkets();
-        try { await mexc.cancelAllOrders(symbol); } catch(e) {}
         await updateAccountEquity();
         setInterval(runBot, 4000);
-        setInterval(updateAccountEquity, 20000); 
-    } catch (e) { console.error("Startup Error:", e.message); }
+        setInterval(updateAccountEquity, 15000); 
+    } catch (e) { console.error(e); }
 }
 app.listen(port, () => start());
