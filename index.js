@@ -35,8 +35,8 @@ let tp1Reached = false;
 
 // Stability States
 let lastOrderUpdateTime = 0; 
-const UPDATE_COOLDOWN = 5 * 60 * 1000; 
-const DRIFT_THRESHOLD = 0.004; 
+const UPDATE_COOLDOWN = 4 * 60 * 1000; // 4 minutes stay
+const DRIFT_THRESHOLD = 0.003; // 0.3% movement before re-hooking
 let latestMarketCtx = null;
 let lastOhlcvFetchTime = 0;
 
@@ -184,6 +184,7 @@ async function runBot() {
             const allowLong = trendUp || ctx.rsi < 32; 
             const allowShort = trendDown || ctx.rsi > 68; 
 
+            // HEAVY SNIPER HOOKS: Pick the absolute extremes
             const buyPrice = parseFloat(mexc.priceToPrecision(symbol, Math.min(ctx.bbLower, ctx.recentLow)));
             const sellPrice = parseFloat(mexc.priceToPrecision(symbol, Math.max(ctx.bbUpper, ctx.recentHigh)));
 
@@ -217,17 +218,15 @@ async function runBot() {
                 const maxAffordable = (liveWalletBalance * leverage * 0.9) / (currentMarketPrice * globalContractSize);
                 const qty = Math.min(targetContracts, maxAffordable);
                 
-                const q1 = parseFloat(mexc.amountToPrecision(symbol, qty * 0.6));
-                const q2 = parseFloat(mexc.amountToPrecision(symbol, qty * 0.4));
+                // SINGLE HEAVY HOOK LOGIC
+                const qtyPrecision = parseFloat(mexc.amountToPrecision(symbol, qty));
 
-                if (q1 > 0) {
+                if (qtyPrecision > 0) {
                     if (allowLong) {
-                        await mexc.createOrder(symbol, 'limit', 'buy', q1, buyPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                        await mexc.createOrder(symbol, 'limit', 'buy', q2, buyPrice * 0.998, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'buy', qtyPrecision, buyPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                     }
                     if (allowShort) {
-                        await mexc.createOrder(symbol, 'limit', 'sell', q1, sellPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                        await mexc.createOrder(symbol, 'limit', 'sell', q2, sellPrice * 1.002, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'sell', qtyPrecision, sellPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                     }
                     lastOrderUpdateTime = now; 
                 }
@@ -250,7 +249,7 @@ async function recordExit(side, entry, exit, size, start) {
 }
 
 // ==========================================
-// RESTORED ELITE UI (V7.7 STYLE)
+// DASHBOARD UI (RESTORED)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -263,14 +262,14 @@ app.get('/', async (req, res) => {
         let posHtml = `
             <div class="active-card">
                 <div class="card-header">
-                    <h2>🧠 LOGIC MATRIX (HYBRID SNAPSHOT)</h2>
+                    <h2>🧠 LOGIC MATRIX (SINGLE HOOK MODE)</h2>
                     <span style="font-size:11px; color:var(--muted)">REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span>
                 </div>
                 <div class="grid grid-cols-4 gap-4 mt-4">
                     <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
                     <div class="stat-box"><span class="label">1M RSI</span><span class="value ${parseFloat(botThinking.rsi) > 65 ? 'text-red' : (parseFloat(botThinking.rsi) < 35 ? 'text-green' : '')}">${botThinking.rsi}</span></div>
                     <div class="stat-box"><span class="label">Entry Valid</span><span class="value">L: ${botThinking.allowLong ? '✅' : '❌'} | S: ${botThinking.allowShort ? '✅' : '❌'}</span></div>
-                    <div class="stat-box"><span class="label">Price Hook</span><span class="value" style="font-size:13px">B: $${(botThinking.buyTarget || 0).toFixed(1)} / S: $${(botThinking.sellTarget || 0).toFixed(1)}</span></div>
+                    <div class="stat-box"><span class="label">Sniper Hook</span><span class="value" style="font-size:13px">B: $${(botThinking.buyTarget || 0).toFixed(1)} / S: $${(botThinking.sellTarget || 0).toFixed(1)}</span></div>
                 </div>
             </div>
         `;
@@ -303,7 +302,7 @@ app.get('/', async (req, res) => {
             <!DOCTYPE html>
             <html lang="en">
             <head>
-                <title>Elite Sniper V8.1 Terminal</title>
+                <title>Elite Sniper V8.2 Terminal</title>
                 <meta http-equiv="refresh" content="5">
                 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
                 <style>
@@ -338,8 +337,8 @@ app.get('/', async (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V8.1 Terminal</h1>
-                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Trend & RSI Hybrid Logic Active</div>
+                    <h1>🎯 Elite Sniper V8.2 Terminal</h1>
+                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Single Heavy Sniper Hook Active</div>
                     
                     <div class="grid grid-cols-4 gap-4">
                         <div class="card">
@@ -388,28 +387,20 @@ app.get('/', async (req, res) => {
 async function start() {
     try {
         await mexc.loadMarkets();
-        
-        // FIX: Clear existing orders first so leverage adjustment is allowed
         console.log("Cleaning up open orders for startup...");
-        try {
-            await mexc.cancelAllOrders(symbol);
-        } catch(e) { console.log("No orders to cancel."); }
+        try { await mexc.cancelAllOrders(symbol); } catch(e) {}
 
         console.log("Setting leverage on MEXC...");
         try {
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 1 }); 
             await mexc.setLeverage(leverage, symbol, { 'openType': 1, 'positionType': 2 });
-        } catch(e) {
-            console.log("Leverage update skipped: " + e.message);
-        }
+        } catch(e) {}
         
         await updateAccountEquity();
         setInterval(runBot, 3000);
         setInterval(updateAccountEquity, 15000); 
-        console.log("🚀 V8.1 Live with Restored UI.");
-    } catch (e) {
-        console.error("Fatal Startup Error:", e.message);
-    }
+        console.log("🚀 V8.2 Live with Single Heavy Sniper Hook.");
+    } catch (e) { console.error("Startup Error:", e.message); }
 }
 
 app.listen(port, () => start());
