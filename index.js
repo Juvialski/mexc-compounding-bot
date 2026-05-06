@@ -33,10 +33,22 @@ let globalContractSize = 0.0001;
 let activePosition = null;
 let tp1Reached = false;
 
-// Stability States (Prevents API Ban/Flickering)
+// Thinking State (For Dashboard Visualization)
+let botThinking = {
+    trend: 'Analysing...',
+    rsi: 0,
+    bbStatus: 'Stable',
+    allowLong: false,
+    allowShort: false,
+    buyTarget: 0,
+    sellTarget: 0,
+    lastUpdate: Date.now()
+};
+
+// Stability States
 let lastOrderUpdateTime = 0; 
-const UPDATE_COOLDOWN = 3 * 60 * 1000; // 3 Minutes min between non-essential updates
-const DRIFT_THRESHOLD = 0.003; // 0.3% price change required to move hooks
+const UPDATE_COOLDOWN = 3 * 60 * 1000; 
+const DRIFT_THRESHOLD = 0.003; 
 
 // Optimization States
 let latestMarketCtx = null;
@@ -131,7 +143,6 @@ async function runBot() {
         const pos = positions.find(p => p.symbol === symbol && parseFloat(p.contracts) > 0);
 
         if (pos) {
-            // === POSITION MANAGEMENT (STRUCTURAL EXITS) ===
             const side = pos.side.toUpperCase();
             const entry = parseFloat(pos.entryPrice);
             const size = parseFloat(pos.contracts);
@@ -169,7 +180,6 @@ async function runBot() {
                 }
             }
         } else {
-            // === HYBRID FISHING MODE (TREND + RSI EXTREMES) ===
             liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false; liveMarginUsed = 0;
             const openOrders = await mexc.fetchOpenOrders(symbol);
             const now = Date.now();
@@ -177,25 +187,31 @@ async function runBot() {
             const buyPrice = parseFloat(mexc.priceToPrecision(symbol, Math.min(ctx.bbLower, ctx.recentLow)));
             const sellPrice = parseFloat(mexc.priceToPrecision(symbol, Math.max(ctx.bbUpper, ctx.recentHigh)));
 
-            // HYBRID FILTER: Allow trade if (Trend aligns) OR (Price is extremely overextended)
             const trendUp = ctx.sma1h ? currentMarketPrice > ctx.sma1h : true;
             const trendDown = ctx.sma1h ? currentMarketPrice < ctx.sma1h : true;
             
             const allowLong = trendUp || ctx.rsi < 35;
             const allowShort = trendDown || ctx.rsi > 65;
 
-            let needsUpdate = false;
+            // UPDATE BOT THINKING STATE FOR DASHBOARD
+            botThinking = {
+                trend: trendUp ? 'BULLISH 📈' : 'BEARISH 📉',
+                rsi: ctx.rsi.toFixed(1),
+                bbStatus: currentMarketPrice > ctx.bbUpper ? 'Overbought' : (currentMarketPrice < ctx.bbLower ? 'Oversold' : 'Neutral'),
+                allowLong,
+                allowShort,
+                buyTarget: buyPrice,
+                sellTarget: sellPrice,
+                lastUpdate: now
+            };
 
+            let needsUpdate = false;
             if (openOrders.length === 0) {
                 needsUpdate = true;
             } else {
                 const hasLong = openOrders.some(o => o.side === 'buy');
                 const hasShort = openOrders.some(o => o.side === 'sell');
-
-                // Update if valid trade sides change based on new Trend/RSI data
                 if (allowLong !== hasLong || allowShort !== hasShort) needsUpdate = true;
-
-                // Update if existing orders have drifted too far and cooldown passed
                 if (!needsUpdate && (now - lastOrderUpdateTime > UPDATE_COOLDOWN)) {
                     const sampleOrder = openOrders[0];
                     const target = sampleOrder.side === 'buy' ? buyPrice : sellPrice;
@@ -205,11 +221,9 @@ async function runBot() {
             }
 
             if (needsUpdate) {
-                console.log(`🔄 Updating Hybrid Traps | RSI: ${ctx.rsi.toFixed(1)} | L: ${allowLong} | S: ${allowShort}`);
                 if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
-                
                 const totalBaseEquity = liveWalletBalance + liveMarginUsed;
-                const riskDist = ctx.atr * 2; // Position sizing reference
+                const riskDist = ctx.atr * 2; 
                 const targetContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (riskDist * globalContractSize);
                 const maxAffordable = (liveWalletBalance * leverage * 0.9) / (currentMarketPrice * globalContractSize);
                 const qty = Math.min(targetContracts, maxAffordable);
@@ -257,7 +271,21 @@ app.get('/', async (req, res) => {
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
         const displayEquity = (liveWalletBalance || 0) + (liveMarginUsed || 0) + (liveUnrealizedPnl || 0);
 
-        let posHtml = `<div class="empty-state">🕸️ HYBRID FISHING ACTIVE (LADDERED)</div>`;
+        let posHtml = `
+            <div class="active-card">
+                <div class="card-header">
+                    <h2>🧠 LOGIC MATRIX (HYBRID SNAPSHOT)</h2>
+                    <span style="font-size:11px; color:var(--muted)">REFRESHED: ${Math.floor((Date.now() - botThinking.lastUpdate)/1000)}s ago</span>
+                </div>
+                <div class="grid grid-cols-4 gap-4 mt-4">
+                    <div class="stat-box"><span class="label">1H Trend</span><span class="value">${botThinking.trend}</span></div>
+                    <div class="stat-box"><span class="label">1M RSI</span><span class="value ${botThinking.rsi > 70 ? 'text-red' : (botThinking.rsi < 30 ? 'text-green' : '')}">${botThinking.rsi}</span></div>
+                    <div class="stat-box"><span class="label">Entry Valid</span><span class="value">L: ${botThinking.allowLong ? '✅' : '❌'} | S: ${botThinking.allowShort ? '✅' : '❌'}</span></div>
+                    <div class="stat-box"><span class="label">Price Hook</span><span class="value" style="font-size:13px">B: $${botThinking.buyTarget} / S: $${botThinking.sellTarget}</span></div>
+                </div>
+            </div>
+        `;
+
         if (activePosition) {
             const notionalSize = activePosition.entryPrice * activePosition.size * globalContractSize;
             const mode = tp1Reached ? '🎯 RUNNER MODE (SL @ ENTRY)' : '🛡️ PROTECTIVE MODE (SL @ STRUCTURE)';
@@ -310,7 +338,6 @@ app.get('/', async (req, res) => {
                     .stat-box { background: var(--card); padding: 12px 15px; border-radius: 8px; border: 1px solid var(--border); }
                     .stat-box .label { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; }
                     .stat-box .value { display: block; font-size: 16px; font-weight: 600; }
-                    .empty-state { margin-top: 25px; padding: 40px; border: 1px dashed var(--border); color: var(--muted); border-radius: 12px; text-align: center; background: rgba(30, 41, 59, 0.3); font-weight: 600;}
                     .pulse-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; animation: pulse 1.5s infinite; }
                     .dot-green { background: var(--green); box-shadow: 0 0 8px var(--green); }
                     .dot-red { background: var(--red); box-shadow: 0 0 8px var(--red); }
