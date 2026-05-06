@@ -2,7 +2,7 @@ const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
 const https = require('https');
-const { RSI, SMA, ATR, MACD, BollingerBands } = require('technicalindicators');
+const { RSI, SMA, ATR, BollingerBands } = require('technicalindicators');
 
 const app = express();
 const port = process.env.PORT || 10000;
@@ -14,6 +14,7 @@ const symbol = 'BTC/USDT:USDT';
 const leverage = 10;
 const riskPerTradePercent = 2.5; 
 const takerFeeRate = 0.0006; 
+const lookbackPeriods = 30; // Look back 30 candles (2.5 hours on 5m) for Highs/Lows
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -24,8 +25,8 @@ const mexc = new ccxt.mexc({
 
 // Global States
 let isTrading = false;
-let liveWalletBalance = 0; // CCXT often returns "Available" here for MEXC
-let liveMarginUsed = 0;    // Added to explicitly track locked collateral
+let liveWalletBalance = 0; 
+let liveMarginUsed = 0;    
 let liveUnrealizedPnl = 0;
 let currentMarketPrice = 0;
 let globalContractSize = 0.0001; 
@@ -70,7 +71,6 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 async function updateAccountEquity() {
     try {
         const balance = await mexc.fetchBalance();
-        // For MEXC Swaps, this often maps to the available (free) balance
         liveWalletBalance = balance.total['USDT'] || liveWalletBalance; 
     } catch(e) { console.error("Equity Sync Failed"); }
 }
@@ -81,7 +81,6 @@ async function getMarketContext() {
         return latestMarketCtx; 
     }
 
-    // Fetch 1H OHLCV for Trend Filter
     const[ohlcv1m, ohlcv5m, ohlcv1h] = await Promise.all([
         mexc.fetchOHLCV(symbol, '1m', undefined, 60),
         mexc.fetchOHLCV(symbol, '5m', undefined, 60),
@@ -89,14 +88,20 @@ async function getMarketContext() {
     ]);
     
     const closes1m = ohlcv1m.map(c => c[4]);
+    const highs5m = ohlcv5m.map(c => c[2]);
+    const lows5m = ohlcv5m.map(c => c[3]);
     const closes5m = ohlcv5m.map(c => c[4]);
     const closes1h = ohlcv1h.map(c => c[4]);
 
     const rsi1m = RSI.calculate({ period: 14, values: closes1m }).pop();
     const bb1m = BollingerBands.calculate({ period: 20, stdDev: 2.5, values: closes1m }).pop();
-    const atr5m = ATR.calculate({ period: 14, high: ohlcv5m.map(c => c[2]), low: ohlcv5m.map(c => c[3]), close: closes5m }).pop();
+    const atr5m = ATR.calculate({ period: 14, high: highs5m, low: lows5m, close: closes5m }).pop();
 
-    // Calculate 200 SMA (Fallback to smaller SMA if less than 200 candles exist)
+    // Structural Highs and Lows
+    const recentHigh = Math.max(...highs5m.slice(-lookbackPeriods));
+    const recentLow = Math.min(...lows5m.slice(-lookbackPeriods));
+    const rangePercent = ((recentHigh - recentLow) / recentLow) * 100;
+
     let sma1h = null;
     if (closes1h.length >= 200) {
         sma1h = SMA.calculate({ period: 200, values: closes1h }).pop();
@@ -109,7 +114,10 @@ async function getMarketContext() {
         bbUpper: bb1m.upper, 
         bbLower: bb1m.lower, 
         atr: atr5m,
-        sma1h: sma1h
+        sma1h: sma1h,
+        recentHigh,
+        recentLow,
+        rangePercent
     };
     lastOhlcvFetchTime = now;
     return latestMarketCtx;
@@ -140,123 +148,108 @@ async function runBot() {
             const size = parseFloat(pos.contracts);
             const pnlUsd = side === 'LONG' ? (currentMarketPrice - entry) * size * globalContractSize : (entry - currentMarketPrice) * size * globalContractSize;
             
-            // Explicitly track the locked margin
             liveMarginUsed = (entry * size * globalContractSize) / leverage;
             const pnlPct = (pnlUsd / liveMarginUsed) * 100;
-            
             liveUnrealizedPnl = pnlUsd;
 
-            // Lock in the initial ATR for Stop Loss calculation to prevent drift
             if(!activePosition) {
-                activePosition = { side, entryPrice: entry, startTime: Date.now(), size, initialAtr: ctx.atr };
-            } else if (!activePosition.initialAtr) {
-                activePosition.initialAtr = ctx.atr; // Failsafe if state lost
+                // Lock in structure at entry time
+                activePosition = { side, entryPrice: entry, startTime: Date.now(), size, stopPrice: side === 'LONG' ? ctx.recentLow : ctx.recentHigh };
             }
             activePosition.pnlPct = pnlPct;
 
             const openOrders = await mexc.fetchOpenOrders(symbol);
             if (openOrders.length > 0) {
                 await mexc.cancelAllOrders(symbol);
-                console.log("🧹 Traps cleared. Transitioned to active position management.");
             }
 
-            const stopDist = activePosition.initialAtr * 1.5; 
-            const tpDist = stopDist * 2.0;
+            // Buffers to avoid "Wick Fishing" (0.15% of price)
+            const structuralBuffer = currentMarketPrice * 0.0015;
 
             if (side === 'LONG') {
-                const sl = tp1Reached ? (entry + (entry * 0.001)) : (entry - stopDist);
-                if (!tp1Reached && currentMarketPrice >= (entry + tpDist)) {
+                const sl = tp1Reached ? (entry + (entry * 0.001)) : (activePosition.stopPrice - structuralBuffer);
+                const tpTarget = ctx.recentHigh; // Target the recent structural top
+
+                if (!tp1Reached && currentMarketPrice >= tpTarget) {
                     await mexc.createMarketSellOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
                     tp1Reached = true;
-                    sendTelegramAlert("🎯 TP1 HIT: Sold 50%, SL moved to entry.");
+                    sendTelegramAlert("🎯 STRUCTURAL TP HIT: Sold 50% at recent high. SL to entry.");
                 }
                 if (currentMarketPrice <= sl) {
                     await mexc.createMarketSellOrder(symbol, size, { 'reduceOnly': true });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
+                    sendTelegramAlert("🚨 STOP LOSS: Structural support failed.");
                 }
             } else {
-                const sl = tp1Reached ? (entry - (entry * 0.001)) : (entry + stopDist);
-                if (!tp1Reached && currentMarketPrice <= (entry - tpDist)) {
+                const sl = tp1Reached ? (entry - (entry * 0.001)) : (activePosition.stopPrice + structuralBuffer);
+                const tpTarget = ctx.recentLow; // Target the recent structural bottom
+
+                if (!tp1Reached && currentMarketPrice <= tpTarget) {
                     await mexc.createMarketBuyOrder(symbol, Math.floor(size/2), { 'reduceOnly': true });
                     tp1Reached = true;
-                    sendTelegramAlert("🎯 TP1 HIT: Sold 50%, SL moved to entry.");
+                    sendTelegramAlert("🎯 STRUCTURAL TP HIT: Sold 50% at recent low. SL to entry.");
                 }
                 if (currentMarketPrice >= sl) {
                     await mexc.createMarketBuyOrder(symbol, size, { 'reduceOnly': true });
                     await recordExit(side, entry, currentMarketPrice, size, activePosition.startTime);
+                    sendTelegramAlert("🚨 STOP LOSS: Structural resistance failed.");
                 }
             }
         } else {
-            // === NO POSITION: LIMIT ORDER FISHING MODE ===
+            // === NO POSITION: LADDERED LIMIT ORDER FISHING ===
             liveUnrealizedPnl = 0; activePosition = null; tp1Reached = false; liveMarginUsed = 0;
             
-            const stopDist = ctx.atr * 1.5;
+            // 1. Calculate risk distance (using structure, not just ATR)
+            const longRiskDist = Math.abs(currentMarketPrice - ctx.recentLow);
+            const shortRiskDist = Math.abs(currentMarketPrice - ctx.recentHigh);
             
-            // 1. Calculate target contracts based on 2.5% risk allowance
             const totalBaseEquity = liveWalletBalance + liveMarginUsed;
-            const targetContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (stopDist * globalContractSize);
-
-            // 2. Calculate the MAXIMUM contracts we can afford with our current balance & leverage
-            const maxAffordableContracts = (liveWalletBalance * leverage) / (currentMarketPrice * globalContractSize);
-
-            // 3. Margin Cap: Take the smaller of the two (with a 5% buffer for fees/slippage)
-            const rawContracts = Math.min(targetContracts, maxAffordableContracts * 0.95);
             
-            // 4. Format precision to MEXC exchange rules
-            let contracts = 0;
-            try {
-                contracts = parseFloat(mexc.amountToPrecision(symbol, rawContracts));
-            } catch (e) {
-                contracts = Math.floor(rawContracts); 
-            }
+            // Position sizing based on distance to the structural low
+            const targetContracts = (totalBaseEquity * (riskPerTradePercent/100)) / (longRiskDist * globalContractSize);
+            const maxAffordable = (liveWalletBalance * leverage * 0.90) / (currentMarketPrice * globalContractSize);
+            const finalContracts = Math.min(targetContracts, maxAffordable);
             
-            if (contracts > 0) {
+            let totalQty = 0;
+            try { totalQty = parseFloat(mexc.amountToPrecision(symbol, finalContracts)); } catch (e) { totalQty = Math.floor(finalContracts); }
+
+            if (totalQty > 0 && ctx.rangePercent > 0.4) {
                 const openOrders = await mexc.fetchOpenOrders(symbol);
                 let needsUpdate = false;
 
-                const buyTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbLower * 1.0005));
-                const sellTrapPrice = parseFloat(mexc.priceToPrecision(symbol, ctx.bbUpper * 0.9995));
+                // Fishing points: Confluence of BB and recent extremes
+                const buyTrap1 = parseFloat(mexc.priceToPrecision(symbol, Math.min(ctx.bbLower, ctx.recentLow)));
+                const buyTrap2 = parseFloat(mexc.priceToPrecision(symbol, buyTrap1 * 0.9985)); // 0.15% deeper
 
-                // Trend Filter - Decide which trades are allowed based on 1H SMA
+                const sellTrap1 = parseFloat(mexc.priceToPrecision(symbol, Math.max(ctx.bbUpper, ctx.recentHigh)));
+                const sellTrap2 = parseFloat(mexc.priceToPrecision(symbol, sellTrap1 * 1.0015)); // 0.15% higher
+
                 const allowLong = ctx.sma1h ? currentMarketPrice > ctx.sma1h : true;
                 const allowShort = ctx.sma1h ? currentMarketPrice < ctx.sma1h : true;
 
-                if (openOrders.length === 0) {
-                    needsUpdate = true;
-                } else {
+                if (openOrders.length === 0) needsUpdate = true;
+                else {
                     const buyO = openOrders.find(o => o.side === 'buy');
-                    const sellO = openOrders.find(o => o.side === 'sell');
-
-                    // If an order exists but is going against the new trend, force update
-                    if ((buyO && !allowLong) || (sellO && !allowShort)) {
-                        needsUpdate = true;
-                    }
-
-                    // Check for price drift
-                    if (buyO && allowLong) {
-                        const buyDrift = Math.abs(parseFloat(buyO.price) - buyTrapPrice) / buyTrapPrice;
-                        if (buyDrift > 0.0015) needsUpdate = true;
-                    }
-                    if (sellO && allowShort) {
-                        const sellDrift = Math.abs(parseFloat(sellO.price) - sellTrapPrice) / sellTrapPrice;
-                        if (sellDrift > 0.0015) needsUpdate = true;
-                    }
+                    if (buyO && Math.abs(parseFloat(buyO.price) - buyTrap1) / buyTrap1 > 0.002) needsUpdate = true;
                 }
 
                 if (needsUpdate) {
                     if (openOrders.length > 0) await mexc.cancelAllOrders(symbol);
                     
-                    if (allowLong) {
-                        await mexc.createOrder(symbol, 'limit', 'buy', contracts, buyTrapPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
-                        console.log(`🕸️ BUY Trap set @ ${buyTrapPrice} | Contracts: ${contracts}`);
+                    const qty1 = parseFloat(mexc.amountToPrecision(symbol, totalQty * 0.6));
+                    const qty2 = parseFloat(mexc.amountToPrecision(symbol, totalQty * 0.4));
+
+                    if (allowLong && qty1 > 0) {
+                        await mexc.createOrder(symbol, 'limit', 'buy', qty1, buyTrap1, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'buy', qty2, buyTrap2, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        console.log(`🪜 LADDERED BUY TRAPS: ${buyTrap1} & ${buyTrap2}`);
                     }
-                    if (allowShort) {
-                        await mexc.createOrder(symbol, 'limit', 'sell', contracts, sellTrapPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
-                        console.log(`🕸️ SELL Trap set @ ${sellTrapPrice} | Contracts: ${contracts}`);
+                    if (allowShort && qty1 > 0) {
+                        await mexc.createOrder(symbol, 'limit', 'sell', qty1, sellTrap1, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'sell', qty2, sellTrap2, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        console.log(`🪜 LADDERED SELL TRAPS: ${sellTrap1} & ${sellTrap2}`);
                     }
                 }
-            } else {
-                console.log(`⚠️ Balance too low to open minimum position size.`);
             }
         }
     } catch (e) { 
@@ -280,7 +273,7 @@ async function recordExit(side, entry, exit, size, start) {
 }
 
 // ==========================================
-// DASHBOARD UI (Fixed Total Equity Formula)
+// DASHBOARD UI 
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -288,13 +281,9 @@ app.get('/', async (req, res) => {
         const recentTrades = allTrades.slice(0, 15);
         const totalPnlUsd = allTrades.reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
         const winRate = allTrades.length > 0 ? ((allTrades.filter(t => t.isWin).length / allTrades.length) * 100).toFixed(1) : 0;
-
-        // =========================================================================
-        // FIXED EQUITY FORMULA: Available Balance + Locked Margin + Unrealized PnL
-        // =========================================================================
         const displayEquity = (liveWalletBalance || 0) + (liveMarginUsed || 0) + (liveUnrealizedPnl || 0);
 
-        let posHtml = `<div class="empty-state">🕸️ FISHING MODE ACTIVE - WAITING FOR A FLASH DIP OR TOP</div>`;
+        let posHtml = `<div class="empty-state">🕸️ LADDERED TRAPS SET - MONITORING STRUCTURAL EXTREMES</div>`;
         if (activePosition) {
             const notionalSize = activePosition.entryPrice * activePosition.size * globalContractSize;
             const mode = tp1Reached ? '🎯 BREAK-EVEN (RUNNER)' : '🛡️ INITIAL RISK';
@@ -323,7 +312,7 @@ app.get('/', async (req, res) => {
             <!DOCTYPE html>
             <html lang="en">
             <head>
-                <title>Elite Sniper V7.2</title>
+                <title>Elite Sniper V7.5 (Laddered)</title>
                 <meta http-equiv="refresh" content="5">
                 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
                 <style>
@@ -359,8 +348,8 @@ app.get('/', async (req, res) => {
             </head>
             <body>
                 <div class="container">
-                    <h1>🎯 Elite Sniper V7.2 Terminal</h1>
-                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Live Equity Sync Enabled</div>
+                    <h1>🎯 Elite Sniper V7.5 Terminal</h1>
+                    <div class="sub-header">Server Time (PHT): ${formatPHT(new Date())} | Laddered structural entries enabled</div>
                     
                     <div class="grid grid-cols-4 gap-4">
                         <div class="card">
@@ -409,11 +398,7 @@ app.get('/', async (req, res) => {
 async function start() {
     await mexc.loadMarkets();
     await updateAccountEquity();
-    
-    // Fast Polling loop (every 2.5 seconds) for price updates
     setInterval(runBot, 2500);
-    
-    // Background loop to keep your Account Balance synced every 15 seconds
     setInterval(updateAccountEquity, 15000); 
 }
 
