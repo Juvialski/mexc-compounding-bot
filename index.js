@@ -193,7 +193,6 @@ async function runBot() {
             const allowLong = trendUp || ctx.rsi < 35;
             const allowShort = trendDown || ctx.rsi > 65;
 
-            // UPDATE BOT THINKING STATE FOR DASHBOARD
             botThinking = {
                 trend: trendUp ? 'BULLISH 📈' : 'BEARISH 📉',
                 rsi: ctx.rsi.toFixed(1),
@@ -232,13 +231,14 @@ async function runBot() {
                 const q2 = parseFloat(mexc.amountToPrecision(symbol, qty * 0.4));
 
                 if (q1 > 0) {
+                    // FIX: Added 'leverage': leverage to params for Isolated Margin (openType: 1)
                     if (allowLong) {
-                        await mexc.createOrder(symbol, 'limit', 'buy', q1, buyPrice, { 'openType': 1, 'positionType': 1 });
-                        await mexc.createOrder(symbol, 'limit', 'buy', q2, buyPrice * 0.998, { 'openType': 1, 'positionType': 1 });
+                        await mexc.createOrder(symbol, 'limit', 'buy', q1, buyPrice, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'buy', q2, buyPrice * 0.998, { 'openType': 1, 'positionType': 1, 'leverage': leverage });
                     }
                     if (allowShort) {
-                        await mexc.createOrder(symbol, 'limit', 'sell', q1, sellPrice, { 'openType': 1, 'positionType': 2 });
-                        await mexc.createOrder(symbol, 'limit', 'sell', q2, sellPrice * 1.002, { 'openType': 1, 'positionType': 2 });
+                        await mexc.createOrder(symbol, 'limit', 'sell', q1, sellPrice, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
+                        await mexc.createOrder(symbol, 'limit', 'sell', q2, sellPrice * 1.002, { 'openType': 1, 'positionType': 2, 'leverage': leverage });
                     }
                     lastOrderUpdateTime = now; 
                 }
@@ -397,10 +397,16 @@ app.get('/', async (req, res) => {
 });
 
 async function start() {
-    await mexc.loadMarkets();
-    await updateAccountEquity();
-    setInterval(runBot, 2500);
-    setInterval(updateAccountEquity, 15000); 
+    try {
+        await mexc.loadMarkets();
+        // ENSURE LEVERAGE IS SET ON STARTUP
+        await mexc.setLeverage(leverage, symbol);
+        await updateAccountEquity();
+        setInterval(runBot, 2500);
+        setInterval(updateAccountEquity, 15000); 
+    } catch (e) {
+        console.error("Startup Error:", e.message);
+    }
 }
 
 app.listen(port, () => start());
