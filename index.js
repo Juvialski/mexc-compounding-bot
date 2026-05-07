@@ -189,19 +189,31 @@ async function evolve() {
                 const riskPct = riskDist / price; 
                 const rewardPct = (riskDist * rr) / price;
 
+                // LONG CONDITION
                 if (price > sma && rsi < rsiT) {
-                    tradesCount++; const sl = price - riskDist; const tp = price + (riskDist * rr);
-                    for (let j = 1; j <= 12; j++) {
-                        let hitSL = lows[i + j] <= sl; let hitTP = highs[i + j] >= tp;
+                    tradesCount++; 
+                    const sl = price - riskDist; 
+                    const tp = price + (riskDist * rr);
+                    
+                    const maxLookForward = Math.min(120, closes.length - i - 1); 
+                    for (let j = 1; j <= maxLookForward; j++) {
+                        let hitSL = lows[i + j] <= sl; 
+                        let hitTP = highs[i + j] >= tp;
                         if (hitSL && hitTP) hitTP = false; 
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
                     }
                 }
+                // SHORT CONDITION
                 if (price < sma && rsi > (100 - rsiT)) {
-                    tradesCount++; const sl = price + riskDist; const tp = price - (riskDist * rr);
-                    for (let j = 1; j <= 12; j++) {
-                        let hitSL = highs[i + j] >= sl; let hitTP = lows[i + j] <= tp;
+                    tradesCount++; 
+                    const sl = price + riskDist; 
+                    const tp = price - (riskDist * rr);
+                    
+                    const maxLookForward = Math.min(120, closes.length - i - 1); 
+                    for (let j = 1; j <= maxLookForward; j++) {
+                        let hitSL = highs[i + j] >= sl; 
+                        let hitTP = lows[i + j] <= tp;
                         if (hitSL && hitTP) hitTP = false; 
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
