@@ -21,7 +21,7 @@ const TIMEFRAME = '1m';
 const LEVERAGE = 10;
 const RISK_PERCENT = 5.0; 
 const TAKER_FEE = 0.0006;
-const SIMULATED_SLIPPAGE = 0.0005; // 0.05% extra penalty in backtests for real-world market execution
+const SIMULATED_SLIPPAGE = 0.0005; // 0.05% extra penalty in backtests 
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -53,10 +53,8 @@ const formatPHT = (dateInput) => {
 // Helper: Send Webhook Alert (Discord/Slack/Etc)
 async function sendNotification(message) {
     const webhookUrl = process.env.WEBHOOK_URL; 
-    if (!webhookUrl) return; // Skip if no webhook URL is provided in .env
-    
+    if (!webhookUrl) return; 
     try {
-        // Native fetch works in Node.js 18+
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -83,9 +81,7 @@ async function pruneDatabase() {
     try {
         const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000));
         const result = await Trade.deleteMany({ time: { $lt: thirtyDaysAgo } });
-        if (result.deletedCount > 0) {
-            console.log(`🧹 DB Pruning: Deleted ${result.deletedCount} trades older than 30 days.`);
-        }
+        if (result.deletedCount > 0) console.log(`🧹 DB Pruning: Deleted ${result.deletedCount} trades.`);
     } catch (e) { console.error("DB Pruning Error:", e.message); }
 }
 
@@ -105,8 +101,6 @@ async function evolve() {
 
         const offsetRSI = closes.length - rsiV.length;
         const offsetSMA = closes.length - smaV.length;
-        
-        // V11 Upgrade: Adding simulated slippage to the backtest fees
         const feePercent = (TAKER_FEE * 2) + SIMULATED_SLIPPAGE; 
 
         const testSettings = (rsiT, atrM, rr) => {
@@ -123,20 +117,18 @@ async function evolve() {
                 const riskPct = riskDist / price;
                 const rewardPct = (riskDist * rr) / price;
 
-                // Long Test
                 if (price > sma && rsi < rsiT) {
                     const sl = price - riskDist;
                     const tp = price + (riskDist * rr);
                     for (let j = 1; j <= 12; j++) {
                         let hitSL = lows[i + j] <= sl;
                         let hitTP = highs[i + j] >= tp;
-                        if (hitSL && hitTP) hitTP = false; // Pessimistic logic
+                        if (hitSL && hitTP) hitTP = false; 
                         
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
                     }
                 }
-                // Short Test
                 if (price < sma && rsi > (100 - rsiT)) {
                     const sl = price + riskDist;
                     const tp = price - (riskDist * rr);
@@ -154,8 +146,8 @@ async function evolve() {
         };
 
         let bestScore = -999;
-        for (let r of [25, 30, 35]) {
-            for (let a of [1.2, 1.5, 2.0]) {
+        for (let r of[25, 30, 35]) {
+            for (let a of[1.2, 1.5, 2.0]) {
                 for (let rr of[1.5, 1.8, 2.2]) {
                     const s = testSettings(r, a, rr);
                     if (s > bestScore) {
@@ -192,24 +184,32 @@ async function tick() {
             const entryPrice = Number(rawPos.entryPrice || 0);
             const contracts = Number(rawPos.contracts || 0);
             
-            activePosition = {
-                side: side,
-                entry: entryPrice,
-                size: contracts,
-                pnlUsd: (side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize
-            };
-            activePosition.roe = (activePosition.pnlUsd / ((entryPrice * contracts * contractSize) / LEVERAGE)) * 100;
+            // Safer calculation to prevent NaN or Infinity values
+            const margin = (entryPrice * contracts * contractSize) / LEVERAGE;
+            const isLong = side === 'LONG';
+            const manualPnlUsd = (isLong ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
+
+            // Prioritize Native Exchange ROE, fallback to manual math
+            const pnlUsd = rawPos.unrealizedPnl !== undefined ? Number(rawPos.unrealizedPnl) : manualPnlUsd;
+            const roe = rawPos.percentage !== undefined ? Number(rawPos.percentage) : (margin > 0 ? (pnlUsd / margin) * 100 : 0);
+            
+            activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe };
 
         } else if (activePosition && !rawPos) {
-            // Position was active last tick, but is gone now (Exchange hit SL or TP)
+            // Position was active last tick, but hit SL or TP
+            // Recalculate TRUE final PnL based on the exit market price
+            const isLong = activePosition.side === 'LONG';
+            const finalPnlUsd = (isLong ? (price - activePosition.entry) : (activePosition.entry - price)) * activePosition.size * contractSize;
+            const margin = (activePosition.entry * activePosition.size * contractSize) / LEVERAGE;
+            const finalRoe = margin > 0 ? (finalPnlUsd / margin) * 100 : 0;
+
             await Trade.create({ 
                 side: activePosition.side, entry: activePosition.entry, exit: price, 
-                pnlUsd: activePosition.pnlUsd, pnlPercent: activePosition.roe, 
-                equityAfter: walletBalance + activePosition.pnlUsd, isWin: activePosition.pnlUsd > 0 
+                pnlUsd: finalPnlUsd, pnlPercent: finalRoe, 
+                equityAfter: walletBalance + finalPnlUsd, isWin: finalPnlUsd > 0 
             });
 
-            // V11 Upgrade: Trade Close Notification
-            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${activePosition.pnlUsd.toFixed(2)} (${activePosition.roe.toFixed(2)}%)`);
+            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             
             activePosition = null;
 
@@ -245,7 +245,6 @@ async function tick() {
                     await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, params);
                     lastOrderTime = Date.now();
 
-                    // V11 Upgrade: Trade Open Notification
                     await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nPrice: $${price.toFixed(2)}\nSize: ${qty} contracts\nLeverage: ${LEVERAGE}x\nSL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)}`);
                 }
             }
@@ -255,16 +254,14 @@ async function tick() {
 }
 
 // ==========================================
-// DASHBOARD UI (Philippine Time Optimized & Mobile Responsive)
+// DASHBOARD UI (Philippine Time Optimized)
 // ==========================================
 app.get('/', async (req, res) => {
     if (dbStatus !== "Connected") {
         return res.send(`
             <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Loading...</title></head>
             <body style="background:#0b0f19; color:#94a3b8; font-family:sans-serif; text-align:center; padding:50px;">
-                <h2>System Initializing...</h2>
-                <p>Database Status: <span style="color:#3b82f6;">${dbStatus}</span></p>
-                <p style="font-size:12px;">Auto-refreshing in 3 seconds...</p>
+                <h2>System Initializing...</h2><p>Database Status: <span style="color:#3b82f6;">${dbStatus}</span></p>
                 <script>setTimeout(() => location.reload(), 3000);</script>
             </body></html>
         `);
@@ -321,13 +318,7 @@ app.get('/', async (req, res) => {
                 .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
-                
-                @media (max-width: 600px) {
-                    .grid { grid-template-columns: repeat(2, 1fr); }
-                    .card { padding: 12px; }
-                    .stat-value { font-size: 16px; }
-                    th, td { font-size: 11px; padding: 6px; }
-                }
+                @media (max-width: 600px) { .grid { grid-template-columns: repeat(2, 1fr); } .card { padding: 12px; } .stat-value { font-size: 16px; } th, td { font-size: 11px; padding: 6px; } }
             </style></head>
             <body><div class="container">
                 <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🎯 SNIPER V11 (PHT)</h2>
@@ -342,7 +333,22 @@ app.get('/', async (req, res) => {
                     <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Trade History (10 Recent)</h3>
                     <div style="overflow-x:auto;">
                         <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL USD</th></tr>
-                        ${allTrades.map(t => `<tr><td>${formatPHT(t.time)}</td><td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td><td class="${(t.pnlPercent || 0)>=0?'text-green':'text-red'}">${(t.pnlPercent || 0).toFixed(2)}%</td><td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td></tr>`).join('')}
+                        ${allTrades.map(t => {
+                            // UI FIX: Retroactively calculate PnL % for older DB entries that saved as 0
+                            let pnlPct = t.pnlPercent;
+                            if ((!pnlPct || pnlPct === 0) && t.entry && t.exit && t.entry > 0) {
+                                const diff = t.side === 'LONG' ? (t.exit - t.entry) : (t.entry - t.exit);
+                                pnlPct = (diff / t.entry) * 100 * LEVERAGE;
+                            }
+                            pnlPct = pnlPct || 0;
+
+                            return `<tr>
+                                <td>${formatPHT(t.time)}</td>
+                                <td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td>
+                                <td class="${pnlPct>=0?'text-green':'text-red'}">${pnlPct.toFixed(2)}%</td>
+                                <td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
+                            </tr>`
+                        }).join('')}
                         </table>
                     </div>
                 </div>
@@ -368,14 +374,14 @@ async function start() {
         await evolve(); 
         await sendNotification(`System Started & Initial DNA Evolved.`);
         
-        setInterval(tick, 10000);           // Check market every 10 seconds 
-        setInterval(async () => {           // Re-evolve DNA & clean DB every 1 hour
+        setInterval(tick, 10000);           
+        setInterval(async () => {           
             await evolve();
             await pruneDatabase();
         }, 3600000);       
         setInterval(async () => {          
             try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {}
-        }, 30000);                          // Sync Wallet Balance every 30 seconds
+        }, 30000);                          
         
     } catch (e) { console.error(e); setTimeout(start, 10000); }
 }
