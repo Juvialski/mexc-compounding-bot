@@ -15,7 +15,7 @@ const leverage = 10;
 const riskPerTradePercent = 2.5; 
 const takerFeeRate = 0.0006; 
 const PROBABILITY_THRESHOLD = 75; 
-const REWARD_RATIO = 1.2; // 1:1.2 RR Ratio for 51%+ Winrate efficiency
+const REWARD_RATIO = 1.2; 
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -136,9 +136,8 @@ async function runBot() {
             
             if(!activePosition) activePosition = { side, entryPrice: entry, startTime: Date.now(), size };
 
-            // 51% WINRATE OPTIMIZED EXIT LOGIC
             const stopDist = ctx.atr15m * 1.5; 
-            const feeBuffer = entry * 0.0015; // Covers 0.12% fees + slippage
+            const feeBuffer = entry * 0.0015; 
             
             const sl = side === 'LONG' ? (entry - stopDist) : (entry + stopDist);
             const tp = side === 'LONG' 
@@ -163,17 +162,20 @@ async function runBot() {
             botThinking = { score: bestScore, trend: currentMarketPrice > ctx.sma1h ? 'BULLISH' : 'BEARISH', volatility: ctx.adx > 30 ? 'TRENDING' : 'STABLE', rsi: ctx.rsi1m.toFixed(1), logic: [`Score: ${bestScore}%`, `Trend: ${bestSide}`], buyTarget: ctx.bb1m.lower, sellTarget: ctx.bb1m.upper, lastUpdate: Date.now() };
 
             if (bestScore >= PROBABILITY_THRESHOLD && (Date.now() - lastOrderUpdateTime > 60000)) {
-                // Risk-Based Sizing
-                const riskAmount = liveWalletBalance * (riskPerTradePercent / 100);
+                // Calculation Fix: Quantity must be an INTEGER for MEXC BTC Swaps
+                const riskUsd = liveWalletBalance * (riskPerTradePercent / 100);
                 const stopDist = ctx.atr15m * 1.5;
-                let qty = (riskAmount * leverage) / currentMarketPrice;
-                qty = mexc.amountToPrecision(symbol, qty);
+                
+                // Position Size = (Risk Amount / Price Distance to Stop) / Contract Size
+                let qty = Math.floor(riskUsd / (stopDist * globalContractSize));
 
-                if (parseFloat(qty) > 0) {
-                    // Limit order at Bollinger Band edge for better R:R
+                // Final safety check: qty must be at least 1 contract
+                if (qty >= 1) {
                     const targetEntry = bestSide === 'LONG' ? ctx.bb1m.lower : ctx.bb1m.upper;
                     await mexc.createOrder(symbol, 'limit', bestSide === 'LONG' ? 'buy' : 'sell', qty, targetEntry, { 'openType': 1, 'positionType': bestSide === 'LONG' ? 1 : 2 });
                     lastOrderUpdateTime = Date.now();
+                } else {
+                    console.log(`⚠️ Calculation too small: Qty ${qty} is less than 1 contract. Increase balance or risk%.`);
                 }
             }
         }
