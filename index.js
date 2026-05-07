@@ -17,10 +17,11 @@ let dna = {
 };
 
 const SYMBOL = 'BTC/USDT:USDT';
-const TIMEFRAME = '1m'; // Unified timeframe
+const TIMEFRAME = '1m'; 
 const LEVERAGE = 10;
 const RISK_PERCENT = 5.0; 
 const TAKER_FEE = 0.0006;
+const SIMULATED_SLIPPAGE = 0.0005; // 0.05% extra penalty in backtests for real-world market execution
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -49,6 +50,21 @@ const formatPHT = (dateInput) => {
     });
 };
 
+// Helper: Send Webhook Alert (Discord/Slack/Etc)
+async function sendNotification(message) {
+    const webhookUrl = process.env.WEBHOOK_URL; 
+    if (!webhookUrl) return; // Skip if no webhook URL is provided in .env
+    
+    try {
+        // Native fetch works in Node.js 18+
+        await fetch(webhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: `🎯 **Sniper V11 Alert**\n${message}` })
+        });
+    } catch (e) { console.error("Notification Error:", e.message); }
+}
+
 // ==========================================
 // DATABASE SCHEMA & CONNECTION
 // ==========================================
@@ -62,12 +78,22 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
     equityAfter: Number, isWin: Boolean, time: { type: Date, default: Date.now }
 }));
 
+// DB Maintenance: Prevent free-tier MongoDB from filling up
+async function pruneDatabase() {
+    try {
+        const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000));
+        const result = await Trade.deleteMany({ time: { $lt: thirtyDaysAgo } });
+        if (result.deletedCount > 0) {
+            console.log(`🧹 DB Pruning: Deleted ${result.deletedCount} trades older than 30 days.`);
+        }
+    } catch (e) { console.error("DB Pruning Error:", e.message); }
+}
+
 // ==========================================
 // EVOLUTION ENGINE (Bi-Directional Backtest)
 // ==========================================
 async function evolve() {
     try {
-        // Fetching 1000 candles to ensure SMA 200 has plenty of data on the 1m chart
         const ohlcv = await mexc.fetchOHLCV(SYMBOL, TIMEFRAME, undefined, 1000);
         const closes = ohlcv.map(c => c[4]);
         const highs = ohlcv.map(c => c[2]);
@@ -79,7 +105,9 @@ async function evolve() {
 
         const offsetRSI = closes.length - rsiV.length;
         const offsetSMA = closes.length - smaV.length;
-        const feePercent = TAKER_FEE * 2; // Round trip fee
+        
+        // V11 Upgrade: Adding simulated slippage to the backtest fees
+        const feePercent = (TAKER_FEE * 2) + SIMULATED_SLIPPAGE; 
 
         const testSettings = (rsiT, atrM, rr) => {
             let score = 0;
@@ -102,7 +130,7 @@ async function evolve() {
                     for (let j = 1; j <= 12; j++) {
                         let hitSL = lows[i + j] <= sl;
                         let hitTP = highs[i + j] >= tp;
-                        if (hitSL && hitTP) hitTP = false; // Pessimistic: assume SL hit first in volatile candle
+                        if (hitSL && hitTP) hitTP = false; // Pessimistic logic
                         
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
@@ -137,6 +165,7 @@ async function evolve() {
                 }
             }
         }
+        console.log(`🧬 DNA Evolved. Best Score: ${bestScore.toFixed(4)}`);
     } catch (e) { console.error("Evolution Error:", e.message); }
 }
 
@@ -178,6 +207,10 @@ async function tick() {
                 pnlUsd: activePosition.pnlUsd, pnlPercent: activePosition.roe, 
                 equityAfter: walletBalance + activePosition.pnlUsd, isWin: activePosition.pnlUsd > 0 
             });
+
+            // V11 Upgrade: Trade Close Notification
+            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${activePosition.pnlUsd.toFixed(2)} (${activePosition.roe.toFixed(2)}%)`);
+            
             activePosition = null;
 
         } else if (Date.now() - lastOrderTime > 60000) {
@@ -204,7 +237,6 @@ async function tick() {
                     const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                     const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                    // Push StopLoss and TakeProfit directly to the Exchange
                     const params = { 
                         'stopLoss': parseFloat(sl.toFixed(2)), 
                         'takeProfit': parseFloat(tp.toFixed(2)) 
@@ -212,6 +244,9 @@ async function tick() {
 
                     await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, params);
                     lastOrderTime = Date.now();
+
+                    // V11 Upgrade: Trade Open Notification
+                    await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nPrice: $${price.toFixed(2)}\nSize: ${qty} contracts\nLeverage: ${LEVERAGE}x\nSL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)}`);
                 }
             }
         }
@@ -223,7 +258,6 @@ async function tick() {
 // DASHBOARD UI (Philippine Time Optimized & Mobile Responsive)
 // ==========================================
 app.get('/', async (req, res) => {
-    // Graceful Loading Screen if DB isn't ready
     if (dbStatus !== "Connected") {
         return res.send(`
             <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Loading...</title></head>
@@ -261,7 +295,7 @@ app.get('/', async (req, res) => {
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V10.5</title>
+            <!DOCTYPE html><html><head><title>Elite Sniper V11</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta http-equiv="refresh" content="5">
             <style>
@@ -288,7 +322,6 @@ app.get('/', async (req, res) => {
                 .pulse-border { animation: border-pulse 2s infinite; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
                 
-                /* Mobile Responsiveness */
                 @media (max-width: 600px) {
                     .grid { grid-template-columns: repeat(2, 1fr); }
                     .card { padding: 12px; }
@@ -297,7 +330,7 @@ app.get('/', async (req, res) => {
                 }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🎯 SNIPER V10.5 (PHT)</h2>
+                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🎯 SNIPER V11 (PHT)</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -333,10 +366,13 @@ async function start() {
         walletBalance = b.total['USDT'] || 0;
         
         await evolve(); 
+        await sendNotification(`System Started & Initial DNA Evolved.`);
         
-        // Polling Rates Relaxed to Avoid API Bans
         setInterval(tick, 10000);           // Check market every 10 seconds 
-        setInterval(evolve, 3600000);       // Re-evolve DNA every 1 hour
+        setInterval(async () => {           // Re-evolve DNA & clean DB every 1 hour
+            await evolve();
+            await pruneDatabase();
+        }, 3600000);       
         setInterval(async () => {          
             try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {}
         }, 30000);                          // Sync Wallet Balance every 30 seconds
