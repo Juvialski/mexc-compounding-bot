@@ -1,18 +1,20 @@
 {
-  "name": "mexc-sniper-btc",
-  "version": "10.0.0",
-  "description": "Evolving BTC bot",
+  "name": "sniper-v11-ai",
+  "version": "1.0.0",
+  "description": "AI-Enhanced Crypto Sniper Bot",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "ccxt": "^4.2.0",
-    "express": "^4.18.2",
-    "mongoose": "^8.0.0",
+    "@google/generative-ai": "^0.1.2",
+    "ccxt": "^4.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^8.4.0",
     "technicalindicators": "^3.1.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
