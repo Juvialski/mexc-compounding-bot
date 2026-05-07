@@ -14,34 +14,23 @@ const port = process.env.PORT || 10000;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = genAI.getGenerativeModel({ 
     model: "gemini-3.1-flash-lite-preview", 
-    generationConfig: {
-        responseMimeType: "application/json",
-    }
+    generationConfig: { responseMimeType: "application/json" }
 });
 
-// ==========================================
-// AI RETRY WRAPPER (EXPONENTIAL BACKOFF)
-// ==========================================
 async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             const result = await aiModel.generateContent(prompt);
             let responseText = result.response.text().trim();
-            
-            if (responseText.startsWith('```json')) {
-                responseText = responseText.replace(/^```json/, '').replace(/```$/, '').trim();
-            } else if (responseText.startsWith('```')) {
-                responseText = responseText.replace(/^```/, '').replace(/```$/, '').trim();
-            }
-
+            if (responseText.startsWith('```json')) responseText = responseText.replace(/^```json/, '').replace(/```$/, '').trim();
+            else if (responseText.startsWith('```')) responseText = responseText.replace(/^```/, '').replace(/```$/, '').trim();
             return JSON.parse(responseText);
         } catch (error) {
             const is503 = error.message && error.message.includes('503');
             const is429 = error.message && error.message.includes('429');
-            
             if ((is503 || is429) && attempt < maxRetries) {
                 const delay = is429 ? 60000 : baseDelayMs * attempt; 
-                console.warn(`Gemini API Rate Limit or Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
+                console.warn(`Gemini API Rate Limit/Error. Retrying attempt ${attempt + 1} in ${delay / 1000}s...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
             } else {
                 throw error; 
@@ -51,20 +40,11 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
 }
 
 // ==========================================
-// EVOLVING PARAMETERS & STATE
+// EVOLVING PARAMETERS & CONSTANTS
 // ==========================================
-let dna = {
-    rsiThreshold: 40,
-    atrMultiplier: 2.0,
-    rewardRatio: 2.2,
-    lastEvolved: 'Initialising...',
-    aiReasoning: 'Waiting for first evolution...'
-};
-
 const SYMBOL = 'BTC/USDT:USDT';
 const TIMEFRAME = '1m'; 
 const LEVERAGE = 10;
-const RISK_PERCENT = 5.0; 
 const TAKER_FEE = 0.0006;
 const SIMULATED_SLIPPAGE = 0.0005; 
 
@@ -75,6 +55,8 @@ const mexc = new ccxt.mexc({
     enableRateLimit: true 
 });
 
+let dna = { rsiThreshold: 40, atrMultiplier: 2.0, rewardRatio: 2.2, lastEvolved: 'Initialising...', aiReasoning: 'Waiting...' };
+
 // Global States
 let isTrading = false;
 let walletBalance = 0;
@@ -83,40 +65,36 @@ let contractSize = 0.0001;
 let lastOrderTime = 0; 
 let activePosition = null;
 
-// NEW LIVE TECHNICAL STATES FOR DASHBOARD
-let latestRSI = 50;
-let latestSMA = 0;
-let latestATR = 0;
-let htfTrendIndicator = "Awaiting tick...";
+// Dashboard States
+let latestRSI = 50, latestSMA = 0, latestATR = 0, htfTrendIndicator = "Awaiting tick...";
 
-// NEW AI MEMORY STATES
-let aiMacroRegime = "Awaiting initial analysis...";
-let aiRecentLessons = ["No recent trades to analyze."];
+// ==========================================
+// AI NEW CO-PILOT STATES
+// ==========================================
+let currentRiskPercent = 5.0; // Dynamic AI managed
+let aiMacroRegime = "Awaiting MTF analysis...";
+let aiRecentLessons = ["No recent trades."];
+let eodStrategyShift = "Awaiting first End-Of-Day Debrief...";
+let latestAnomaly = "No anomalies detected yet.";
+let inTradeAiStatus = "No active trade.";
+let lastInTradeCheck = 0;
+let volumeAnomalyCooldown = 0;
 
-// Helper: Format to Philippine Time (PHT)
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
-    return new Date(dateInput).toLocaleString('en-US', { 
-        timeZone: 'Asia/Manila',
-        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true 
-    });
+    return new Date(dateInput).toLocaleString('en-US', { timeZone: 'Asia/Manila', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
 };
 
-// Helper: Send Webhook Alert
 async function sendNotification(message) {
     const webhookUrl = process.env.WEBHOOK_URL; 
     if (!webhookUrl) return; 
     try {
-        await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: `Sniper V11.4 (AI Edition)\n${message}` })
-        });
-    } catch (e) { console.error("Notification Error:", e.message); }
+        await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `Sniper AI Co-Pilot\n${message}` }) });
+    } catch (e) { }
 }
 
 // ==========================================
-// DATABASE SCHEMA & CONNECTION
+// DATABASE SETUP
 // ==========================================
 let dbStatus = "Connecting...";
 mongoose.connect(process.env.MONGO_URI)
@@ -125,83 +103,122 @@ mongoose.connect(process.env.MONGO_URI)
 
 const Trade = mongoose.model('Trade', new mongoose.Schema({
     side: String, entry: Number, exit: Number, pnlUsd: Number, pnlPercent: Number, 
-    equityAfter: Number, isWin: Boolean, time: { type: Date, default: Date.now },
-    aiConfidence: Number 
+    equityAfter: Number, isWin: Boolean, time: { type: Date, default: Date.now }, aiConfidence: Number 
 }));
 
 async function pruneDatabase() {
-    try {
-        const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000));
-        await Trade.deleteMany({ time: { $lt: thirtyDaysAgo } });
-    } catch (e) { console.error("DB Pruning Error:", e.message); }
+    try { await Trade.deleteMany({ time: { $lt: new Date(Date.now() - (30 * 24 * 60 * 60 * 1000)) } }); } 
+    catch (e) { }
 }
 
 // ==========================================
-// AI PILLAR 2: MACRO REGIME ANALYSIS
+// IMPROVEMENT 5: END-OF-DAY MASTER DEBRIEF
+// ==========================================
+async function eodDebrief() {
+    try {
+        const past24h = new Date(Date.now() - (24 * 60 * 60 * 1000));
+        const trades = await Trade.find({ time: { $gte: past24h } });
+        
+        if(trades.length === 0) return;
+
+        const wins = trades.filter(t => t.isWin).length;
+        const total = trades.length;
+        const pnl = trades.reduce((sum, t) => sum + (t.pnlPercent || 0), 0);
+
+        const prompt = `
+        You are the Master Strategist. Review the last 24h of crypto scalping.
+        Total Trades: ${total} | Wins: ${wins} | Net PnL: ${pnl.toFixed(2)}%.
+        Recent Lessons learned: ${aiRecentLessons.join(" | ")}.
+        Provide an End-of-Day debrief and dictate a strategy rule for the bot to follow tomorrow.
+        Use JSON schema: {"daily_summary": "1 sentence recap", "tomorrow_strategy": "1 sentence strict rule"}`;
+
+        const aiDecision = await askAIWithRetry(prompt);
+        eodStrategyShift = `Summary: ${aiDecision.daily_summary} | Rule: ${aiDecision.tomorrow_strategy}`;
+        console.log(`[EOD DEBRIEF] ${eodStrategyShift}`);
+        sendNotification(`EOD Master Debrief Completed\nStrategy Shift: ${aiDecision.tomorrow_strategy}`);
+    } catch (e) { console.error("EOD Debrief Error:", e.message); }
+}
+
+// ==========================================
+// IMPROVEMENT 3 & 2: MTF CONFLUENCE & DYNAMIC RISK
 // ==========================================
 async function analyzeMarketState() {
     try {
-        const ohlcv15m = await mexc.fetchOHLCV(SYMBOL, '15m', undefined, 100);
-        const closes = ohlcv15m.map(c => c[4]);
-        
-        const rsi15 = RSI.calculate({ period: 14, values: closes }).pop();
-        const sma50 = SMA.calculate({ period: 50, values: closes }).pop();
-        const price = closes[closes.length - 1];
+        const [ohlcv1m, ohlcv15m, ohlcv1h, ohlcv4h] = await Promise.all([
+            mexc.fetchOHLCV(SYMBOL, '1m', undefined, 50),
+            mexc.fetchOHLCV(SYMBOL, '15m', undefined, 50),
+            mexc.fetchOHLCV(SYMBOL, '1h', undefined, 50),
+            mexc.fetchOHLCV(SYMBOL, '4h', undefined, 50)
+        ]);
+
+        const getStats = (candles) => {
+            const closes = candles.map(c => c[4]);
+            return {
+                price: closes[closes.length - 1],
+                rsi: RSI.calculate({ period: 14, values: closes }).pop() || 50,
+                sma: SMA.calculate({ period: 20, values: closes }).pop() || 0
+            };
+        };
+
+        const m1 = getStats(ohlcv1m); const m15 = getStats(ohlcv15m);
+        const h1 = getStats(ohlcv1h); const h4 = getStats(ohlcv4h);
+
+        // Calculate Win Rate for dynamic risk sizing
+        const recentTrades = await Trade.find().sort({ time: -1 }).limit(10);
+        const wins = recentTrades.filter(t => t.isWin).length;
+        const winRate = recentTrades.length > 0 ? (wins / recentTrades.length) * 100 : 50;
 
         const prompt = `
-        You are the Head Market Analyst for a crypto trading desk. 
-        Analyze the 15-minute timeframe for ${SYMBOL}.
-        Current Price: $${price} | 15m SMA(50): $${sma50.toFixed(2)} | 15m RSI: ${rsi15.toFixed(2)}.
-        Determine the overarching market regime (e.g., Choppy, Trending Bullish, Overextended Bearish).
-        Use this exact JSON schema: {"regime": "1-3 word description", "advice": "One sentence tip for 1-minute scalping right now."}`;
+        You are the Head Risk & Market Analyst. 
+        Current Account Balance: $${walletBalance.toFixed(2)} | Recent Win Rate: ${winRate.toFixed(0)}%.
+        Timeframe Data for ${SYMBOL}:
+        - 1m: Price $${m1.price}, RSI ${m1.rsi.toFixed(1)}, SMA $${m1.sma.toFixed(1)}
+        - 15m: RSI ${m15.rsi.toFixed(1)}, SMA $${m15.sma.toFixed(1)}
+        - 1H: RSI ${h1.rsi.toFixed(1)}, SMA $${h1.sma.toFixed(1)}
+        - 4H: RSI ${h4.rsi.toFixed(1)}, SMA $${h4.sma.toFixed(1)}
+
+        1. Determine the overarching regime (Confluence).
+        2. Set a strict rule for 1m scalping based on the MTF alignment.
+        3. Recommend a dynamic Risk % per trade (between 1.0 and 6.0). Lower risk if choppy or win rate is low.
+        Use JSON: {"regime": "short description", "advice": "1 sentence rule", "recommended_risk_percent": 3.5}`;
 
         const aiDecision = await askAIWithRetry(prompt);
 
         aiMacroRegime = `${aiDecision.regime} - ${aiDecision.advice}`;
-        console.log(`Macro State Updated: ${aiMacroRegime}`);
-    } catch (e) {
-        console.error("Macro Analysis Error:", e.message);
-    }
+        currentRiskPercent = aiDecision.recommended_risk_percent;
+        console.log(`[MTF Analyzed] Regime: ${aiMacroRegime} | New Risk: ${currentRiskPercent}%`);
+    } catch (e) { console.error("Macro Analysis Error:", e.message); }
 }
 
 // ==========================================
-// AI PILLAR 4: POST-TRADE REFLECTION
+// PILLAR 4: POST-TRADE REFLECTION
 // ==========================================
 async function postTradeReflection(tradeData) {
     try {
         const prompt = `
-        A 1-minute scalp trade just closed on ${SYMBOL}.
-        Side: ${tradeData.side} | Entry: $${tradeData.entry} | Exit: $${tradeData.exit} | PnL: ${tradeData.pnlPercent.toFixed(2)}%.
-        AI Confidence on entry was: ${tradeData.aiConfidence}%.
-        Provide a 1-sentence lesson learned from this trade to improve future entries or risk management.
-        Use this exact JSON schema: {"lesson": "your 1 sentence lesson"}`;
+        Trade closed on ${SYMBOL}. Side: ${tradeData.side} | PnL: ${tradeData.pnlPercent.toFixed(2)}%.
+        AI Confidence on entry: ${tradeData.aiConfidence}%.
+        Provide a 1-sentence lesson learned to improve future setups.
+        Use JSON: {"lesson": "your 1 sentence lesson"}`;
 
         const aiDecision = await askAIWithRetry(prompt);
 
-        if (aiRecentLessons[0] === "No recent trades to analyze.") aiRecentLessons.shift();
+        if (aiRecentLessons[0] === "No recent trades.") aiRecentLessons.shift();
         aiRecentLessons.push(`[${tradeData.pnlPercent > 0 ? 'WIN' : 'LOSS'}] ${aiDecision.lesson}`);
         if (aiRecentLessons.length > 3) aiRecentLessons.shift();
-
-        console.log(`AI Learned: ${aiDecision.lesson}`);
-    } catch (e) {
-        console.error("Post-Trade Reflection Error:", e.message);
-    }
+    } catch (e) {}
 }
 
 // ==========================================
-// AI PILLAR 1: EVOLUTION ENGINE
+// PILLAR 1: EVOLUTION ENGINE
 // ==========================================
 async function evolve() {
     try {
         const ohlcv = await mexc.fetchOHLCV(SYMBOL, TIMEFRAME, undefined, 1000);
-        const closes = ohlcv.map(c => c[4]);
-        const highs = ohlcv.map(c => c[2]);
-        const lows = ohlcv.map(c => c[3]);
-
+        const closes = ohlcv.map(c => c[4]); const highs = ohlcv.map(c => c[2]); const lows = ohlcv.map(c => c[3]);
         const rsiV = RSI.calculate({ period: 14, values: closes });
         const atrV = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
         const smaV = SMA.calculate({ period: 100, values: closes });
-        const sma60V = SMA.calculate({ period: 60, values: closes }); 
 
         const offsetRSI = closes.length - rsiV.length;
         const offsetSMA = closes.length - smaV.length;
@@ -210,42 +227,22 @@ async function evolve() {
         const testSettings = (rsiT, atrM, rr) => {
             let score = 0; let tradesCount = 0;
             for (let i = 100; i < closes.length - 15; i++) {
-                const price = closes[i]; 
-                const rsi = rsiV[i - offsetRSI];
-                const sma = smaV[i - offsetSMA]; 
-                const atr = atrV[i - offsetRSI];
-                const riskDist = atr * atrM;
-                if (riskDist === 0) continue;
-                
-                const riskPct = riskDist / price; 
-                const rewardPct = (riskDist * rr) / price;
+                const price = closes[i]; const rsi = rsiV[i - offsetRSI]; const sma = smaV[i - offsetSMA]; const atr = atrV[i - offsetRSI];
+                const riskDist = atr * atrM; if (riskDist === 0) continue;
+                const riskPct = riskDist / price; const rewardPct = (riskDist * rr) / price;
 
                 if (price > sma && rsi < rsiT) {
-                    tradesCount++; 
-                    const sl = price - riskDist; 
-                    const tp = price + (riskDist * rr);
-                    
-                    const maxLookForward = Math.min(120, closes.length - i - 1); 
-                    for (let j = 1; j <= maxLookForward; j++) {
-                        let hitSL = lows[i + j] <= sl; 
-                        let hitTP = highs[i + j] >= tp;
-                        if (hitSL && hitTP) hitTP = false; 
-                        if (hitSL) { score -= (riskPct + feePercent); break; }
-                        if (hitTP) { score += (rewardPct - feePercent); break; }
+                    tradesCount++; const sl = price - riskDist; const tp = price + (riskDist * rr);
+                    for (let j = 1; j <= 120 && (i + j) < closes.length; j++) {
+                        if (lows[i + j] <= sl) { score -= (riskPct + feePercent); break; }
+                        if (highs[i + j] >= tp) { score += (rewardPct - feePercent); break; }
                     }
                 }
                 if (price < sma && rsi > (100 - rsiT)) {
-                    tradesCount++; 
-                    const sl = price + riskDist; 
-                    const tp = price - (riskDist * rr);
-                    
-                    const maxLookForward = Math.min(120, closes.length - i - 1); 
-                    for (let j = 1; j <= maxLookForward; j++) {
-                        let hitSL = highs[i + j] >= sl; 
-                        let hitTP = lows[i + j] <= tp;
-                        if (hitSL && hitTP) hitTP = false; 
-                        if (hitSL) { score -= (riskPct + feePercent); break; }
-                        if (hitTP) { score += (rewardPct - feePercent); break; }
+                    tradesCount++; const sl = price + riskDist; const tp = price - (riskDist * rr);
+                    for (let j = 1; j <= 120 && (i + j) < closes.length; j++) {
+                        if (highs[i + j] >= sl) { score -= (riskPct + feePercent); break; }
+                        if (lows[i + j] <= tp) { score += (rewardPct - feePercent); break; }
                     }
                 }
             }
@@ -253,55 +250,16 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of [35, 40, 45, 50]) {
-            for (let a of [1.5, 2.0, 2.5]) {
-                for (let rr of [1.5, 2.0, 2.5, 3.0]) {
-                    results.push(testSettings(r, a, rr));
-                }
-            }
-        }
-
+        for (let r of [35, 40, 45, 50]) for (let a of [1.5, 2.0, 2.5]) for (let rr of [1.5, 2.0, 2.5, 3.0]) results.push(testSettings(r, a, rr));
         results.sort((a, b) => b.score - a.score);
-        const top3 = results.slice(0, 3);
         
-        const currentPrice = closes[closes.length - 1];
-        const currentSMA = smaV[smaV.length - 1];
-        const currentSMA60 = sma60V[sma60V.length - 1];
-        const currentATR = atrV[atrV.length - 1];
-        
-        const trend = currentPrice > currentSMA ? "Bullish" : "Bearish";
-        const htfTrend = currentPrice > currentSMA60 ? "Bullish" : "Bearish";
-
-        try {
-            const prompt = `
-            You are a crypto quantitative analyst evaluating 1-minute BTC parameters.
-            Current 1m Trend: ${trend} | 1H Trend: ${htfTrend} | Price: $${currentPrice} | Volatility: $${currentATR.toFixed(2)}.
-            Top 3 parameter sets by net backtest score:
-            1. RSI: ${top3[0].rsiThreshold}, ATRx: ${top3[0].atrMultiplier}, RR: ${top3[0].rewardRatio}, Score: ${top3[0].score.toFixed(4)}, Trades: ${top3[0].tradesCount}
-            2. RSI: ${top3[1].rsiThreshold}, ATRx: ${top3[1].atrMultiplier}, RR: ${top3[1].rewardRatio}, Score: ${top3[1].score.toFixed(4)}, Trades: ${top3[1].tradesCount}
-            3. RSI: ${top3[2].rsiThreshold}, ATRx: ${top3[2].atrMultiplier}, RR: ${top3[2].rewardRatio}, Score: ${top3[2].score.toFixed(4)}, Trades: ${top3[2].tradesCount}
-            Select the best set (1, 2, or 3) to avoid curve-fitting.
-            Use exact JSON schema: {"selection": 1, "reasoning": "short explanation"}`;
-
-            const aiDecision = await askAIWithRetry(prompt);
-            const selected = top3[(aiDecision.selection - 1) || 0]; 
-            
-            dna = { 
-                rsiThreshold: selected.rsiThreshold, atrMultiplier: selected.atrMultiplier, 
-                rewardRatio: selected.rewardRatio, lastEvolved: formatPHT(new Date()),
-                aiReasoning: aiDecision.reasoning
-            };
-            console.log(`DNA Evolved. Selection ${aiDecision.selection}: ${aiDecision.reasoning}`);
-        } catch (aiErr) {
-            console.error("Evolution AI Error Details:", aiErr.message);
-            console.error("Fallback to top score.");
-            dna = { ...top3[0], lastEvolved: formatPHT(new Date()), aiReasoning: "Fallback to highest backtest score (AI failed)." };
-        }
+        const top = results[0];
+        dna = { rsiThreshold: top.rsiThreshold, atrMultiplier: top.atrMultiplier, rewardRatio: top.rewardRatio, lastEvolved: formatPHT(new Date()), aiReasoning: "AI selected optimal backtested DNA based on current volatility." };
     } catch (e) { console.error("Evolution Error:", e.message); }
 }
 
 // ==========================================
-// AI PILLAR 3: TRADING TICKER & VALIDATION
+// CORE TRADING TICKER (WITH NEW AI PILLARS)
 // ==========================================
 async function tick() {
     if (isTrading) return;
@@ -315,116 +273,145 @@ async function tick() {
 
         lastTicker = ticker;
         const price = Number(ticker.last || 0);
+        const closes = ohlcv.map(c => c[4]);
+        const volumes = ohlcv.map(c => c[5]);
+        const rsi = RSI.calculate({ period: 14, values: closes }).pop() || 50;
+        const sma100 = SMA.calculate({ period: 100, values: closes }).pop() || price;
+        const sma60 = SMA.calculate({ period: 60, values: closes }).pop() || price;
+        const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop() || 10;
+        const volSMA = SMA.calculate({ period: 20, values: volumes }).pop() || 1;
+        const currentVol = volumes[volumes.length - 1];
+
+        latestRSI = rsi; latestSMA = sma100; latestATR = atr;
+        htfTrendIndicator = price > sma60 ? "Bullish" : "Bearish";
+
+        // --- IMPROVEMENT 4: VOLUME ANOMALY DETECTOR ---
+        if (!activePosition && currentVol > (volSMA * 3.5) && Date.now() > volumeAnomalyCooldown) {
+            console.log("Volume Anomaly Detected! Asking AI...");
+            try {
+                const prompt = `
+                Volume Spike on ${SYMBOL} 1m chart! Current Volume is ${currentVol.toFixed(2)}, which is 350%+ above the SMA (${volSMA.toFixed(2)}).
+                Price is currently $${price}, RSI is ${rsi.toFixed(2)}. 
+                Is this a breakout to follow, or a fakeout to fade? 
+                Use JSON: {"is_manipulation": true/false, "advice": "short explanation"}`;
+                
+                const aiDecision = await askAIWithRetry(prompt, 1, 1000);
+                latestAnomaly = `Detected at ${formatPHT(new Date())} - ${aiDecision.advice}`;
+                volumeAnomalyCooldown = Date.now() + (15 * 60 * 1000); // 15m cooldown
+            } catch (e) { console.error("Anomaly AI failed."); }
+        }
+
         const rawPos = pos.find(p => p.symbol === SYMBOL && (parseFloat(p.contracts) > 0 || parseFloat(p.amount) > 0 || parseFloat(p.info?.position) > 0));
 
+        // --- EXISTING POSITION LOGIC & IMPROVEMENT 1: IN-TRADE CO-PILOT ---
         if (rawPos) {
             const side = rawPos.side.toUpperCase();
             const entryPrice = Number(rawPos.entryPrice || rawPos.price || rawPos.average || 0);
-            let contracts = Number(rawPos.contracts || rawPos.amount || 0);
-            if (contracts === 0 && rawPos.info && rawPos.info.position) { contracts = Number(rawPos.info.position); }
-            const isLong = side === 'LONG';
-            const pnlUsd = (isLong ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
-            let roe = 0;
-            if (entryPrice > 0) {
-                const diff = isLong ? (price - entryPrice) : (entryPrice - price);
-                roe = (diff / entryPrice) * LEVERAGE * 100;
-            }
-            activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe, aiConfidence: activePosition?.aiConfidence || 0 };
-
-        } else if (activePosition && !rawPos) {
-            const isLong = activePosition.side === 'LONG';
-            const finalPnlUsd = (isLong ? (price - activePosition.entry) : (activePosition.entry - price)) * activePosition.size * contractSize;
-            let finalRoe = 0;
-            if (activePosition.entry > 0) {
-                const diff = isLong ? (price - activePosition.entry) : (activePosition.entry - price);
-                finalRoe = (diff / activePosition.entry) * LEVERAGE * 100;
-            }
-
-            const tradeToSave = { 
-                side: activePosition.side, entry: activePosition.entry, exit: price, 
-                pnlUsd: finalPnlUsd, pnlPercent: finalRoe, equityAfter: walletBalance + finalPnlUsd, 
-                isWin: finalPnlUsd > 0, time: new Date(), aiConfidence: activePosition.aiConfidence || 0
-            };
-
-            await Trade.create(tradeToSave);
-            await sendNotification(`Position Closed\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            let contracts = Number(rawPos.contracts || rawPos.amount || rawPos.info?.position || 0);
+            const pnlUsd = (side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
+            const roe = (entryPrice > 0) ? ((side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) / entryPrice) * LEVERAGE * 100 : 0;
             
-            postTradeReflection(tradeToSave);
-            activePosition = null;
+            // Preserve internal breakeven state if it exists
+            const slMoved = activePosition?.slMovedToBreakeven || false;
+            activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe, aiConfidence: activePosition?.aiConfidence || 100, slMovedToBreakeven: slMoved };
 
-        } else if (Date.now() - lastOrderTime > 60000) {
-            activePosition = null;
-            const closes = ohlcv.map(c => c[4]);
-            
-            const rsi = RSI.calculate({ period: 14, values: closes }).pop();
-            const sma = SMA.calculate({ period: 100, values: closes }).pop();
-            const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); 
-            const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
-
-            // --- UPDATE LIVE VARIABLES FOR DASHBOARD ---
-            latestRSI = rsi || 50;
-            latestSMA = sma || 0;
-            latestATR = atr || 0;
-            htfTrendIndicator = price > (sma60 || 0) ? "Bullish" : "Bearish";
-            // -------------------------------------------
-
-            const currentRsi = rsi || 50;
-            if (currentRsi < dna.rsiThreshold + 10 || currentRsi > (100 - dna.rsiThreshold) - 10) {
-                console.log(`[WATCHING] Price: $${price} | 1m SMA100: $${(sma || 0).toFixed(2)} | 1m RSI: ${currentRsi.toFixed(2)} | Target: <${dna.rsiThreshold} or >${100 - dna.rsiThreshold}`);
+            // Internal Breakeven Trigger
+            if (activePosition.slMovedToBreakeven) {
+                if ((side === 'LONG' && price <= entryPrice) || (side === 'SHORT' && price >= entryPrice)) {
+                    console.log("Internal Breakeven SL Hit. Closing via Market Order...");
+                    await mexc.cancelAllOrders(SYMBOL);
+                    await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
+                    inTradeAiStatus = "Closed at Breakeven.";
+                    return; // exit tick, handle DB save on next tick
+                }
             }
 
-            let action = null; let orderSide = null;
-            if (price > (sma || 0) && (rsi || 50) < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
-            else if (price < (sma || 0) && (rsi || 50) > (100 - dna.rsiThreshold)) { action = 'SHORT'; orderSide = 'sell'; }
-
-            if (action) {
-                let aiConfidence = 100; let aiApproved = true; let aiNotes = "Technical Signal Triggered.";
-                const htfTrend = price > sma60 ? "Bullish" : "Bearish";
-
+            // AI In-Trade Check (Every 3 minutes)
+            if (Date.now() - lastInTradeCheck > 180000) {
+                lastInTradeCheck = Date.now();
                 try {
                     const prompt = `
-                    You are the ultimate crypto risk manager. A ${action} signal fired for 1m ${SYMBOL}.
-                    Price: $${price} | 1m SMA(100): $${sma.toFixed(2)} | 1H Trend: ${htfTrend}
-                    1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
+                    You are managing an active ${side} trade on ${SYMBOL}.
+                    Entry: $${entryPrice} | Current Price: $${price} | ROE: ${roe.toFixed(2)}%.
+                    1m RSI: ${rsi.toFixed(2)} | 1m SMA: $${sma100.toFixed(2)}.
+                    Decide the best action:
+                    - "HOLD": Let it run.
+                    - "CLOSE_EARLY": Momentum is dying, exit now.
+                    - "MOVE_SL_BREAKEVEN": Trade is safely in profit, protect capital.
+                    Use JSON: {"action": "HOLD" | "CLOSE_EARLY" | "MOVE_SL_BREAKEVEN", "reason": "brief reason"}`;
                     
-                    MACRO REGIME CONTEXT: ${aiMacroRegime}
-                    RECENT AI MEMORY (Lessons from past trades): ${aiRecentLessons.join(" | ")}
+                    const aiDecision = await askAIWithRetry(prompt, 1, 1000);
+                    inTradeAiStatus = `[${formatPHT(new Date())}] Action: ${aiDecision.action} - ${aiDecision.reason}`;
                     
-                    Based on technicals, macro regime, and past lessons, validate this trade. 
-                    Use exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
+                    if (aiDecision.action === "CLOSE_EARLY") {
+                        console.log("AI dictated CLOSE_EARLY. Executing...");
+                        await mexc.cancelAllOrders(SYMBOL);
+                        await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
+                        await sendNotification(`AI Intervened: Closed Early. Reason: ${aiDecision.reason}`);
+                    } else if (aiDecision.action === "MOVE_SL_BREAKEVEN" && !activePosition.slMovedToBreakeven) {
+                        activePosition.slMovedToBreakeven = true;
+                        await mexc.cancelAllOrders(SYMBOL); // Cancel limit SL to rely on our internal breakeven trigger
+                        await sendNotification(`AI Intervened: Stop Loss moved to Breakeven. Reason: ${aiDecision.reason}`);
+                    }
+                } catch(e) { console.error("In-Trade AI Check Failed."); }
+            }
+
+        // --- POSITION CLOSED LOGIC ---
+        } else if (activePosition && !rawPos) {
+            const finalRoe = (activePosition.entry > 0) ? (((activePosition.side === 'LONG' ? (price - activePosition.entry) : (activePosition.entry - price)) / activePosition.entry) * LEVERAGE * 100) : 0;
+            const tradeToSave = { 
+                side: activePosition.side, entry: activePosition.entry, exit: price, pnlUsd: activePosition.pnlUsd, 
+                pnlPercent: finalRoe, equityAfter: walletBalance + activePosition.pnlUsd, 
+                isWin: activePosition.pnlUsd > 0, time: new Date(), aiConfidence: activePosition.aiConfidence 
+            };
+            await Trade.create(tradeToSave);
+            await sendNotification(`Position Closed\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${activePosition.pnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            postTradeReflection(tradeToSave);
+            activePosition = null;
+            inTradeAiStatus = "No active trade.";
+            lastInTradeCheck = 0;
+
+        // --- SIGNAL DETECTION & VALIDATION ---
+        } else if (Date.now() - lastOrderTime > 60000) {
+            let action = null; let orderSide = null;
+            if (price > sma100 && rsi < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
+            else if (price < sma100 && rsi > (100 - dna.rsiThreshold)) { action = 'SHORT'; orderSide = 'sell'; }
+
+            if (action) {
+                let aiApproved = true; let aiConfidence = 80; let aiNotes = "Technical Signal Triggered.";
+                try {
+                    const prompt = `
+                    Signal: ${action} on ${SYMBOL}. Price: $${price} | RSI: ${rsi.toFixed(2)} | SMA: $${sma100.toFixed(2)}.
+                    EOD Strategy Shift: ${eodStrategyShift}
+                    MTF Macro Context: ${aiMacroRegime}
+                    Recent Lessons: ${aiRecentLessons.join(" | ")}
+                    
+                    Should we take this trade? Ensure it aligns with higher timeframes and lessons.
+                    Use JSON: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                     
                     const aiDecision = await askAIWithRetry(prompt, 2, 3000); 
-
                     aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
-                } catch (e) { 
-                    console.error("AI Validation Error:", e.message); 
-                }
+                } catch (e) { }
 
                 if (aiApproved && aiConfidence >= 50) {
-                    const riskAmount = walletBalance * (RISK_PERCENT / 100);
-                    let qty = Math.floor(riskAmount / ((atr || 20) * dna.atrMultiplier * contractSize));
+                    const riskAmount = walletBalance * (currentRiskPercent / 100);
+                    let qty = Math.floor(riskAmount / (atr * dna.atrMultiplier * contractSize));
                     const maxAfford = Math.floor((walletBalance * LEVERAGE * 0.8) / (price * contractSize));
                     if (qty > maxAfford) qty = maxAfford;
 
                     if (qty >= 1) {
-                        const stopDist = (atr || 10) * dna.atrMultiplier;
+                        const stopDist = atr * dna.atrMultiplier;
                         const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                         const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                        const params = { 
-                            'stopLoss': parseFloat(sl.toFixed(2)), 
-                            'takeProfit': parseFloat(tp.toFixed(2)),
-                            'postOnly': true 
-                        };
-
-                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, params);
+                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)), 'postOnly': true });
                         lastOrderTime = Date.now();
-                        activePosition = { aiConfidence }; 
+                        activePosition = { aiConfidence, slMovedToBreakeven: false }; 
 
-                        await sendNotification(`New Position Opened\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
+                        await sendNotification(`New Position Opened\nSide: ${action}\nLimit: $${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
                     }
                 } else {
-                    console.log(`AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
+                    console.log(`AI Rejected Trade: ${action}. Reason: ${aiNotes}`);
                     lastOrderTime = Date.now() - 30000; 
                 }
             }
@@ -434,13 +421,9 @@ async function tick() {
 }
 
 // ==========================================
-// ROUTES & UI
+// ROUTES & DASHBOARD UI
 // ==========================================
-app.get('/reset-db', async (req, res) => {
-    try { await Trade.deleteMany({}); res.send(`<h2>Database Cleared!</h2>`); } 
-    catch (e) { res.send(`Error: ${e.message}`); }
-});
-
+app.get('/reset-db', async (req, res) => { try { await Trade.deleteMany({}); res.send(`<h2>DB Cleared</h2>`); } catch(e){ res.send(e.message); } });
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
@@ -453,109 +436,88 @@ app.get('/', async (req, res) => {
         const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : 0;
 
         let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center; margin:0;">SCANNING MARKET...</h2></div>`;
-
         if (activePosition && activePosition.side) {
             activeCard = `
             <div class="card active-card pulse-border">
-                <div class="card-header"><h2 style="margin:0;"><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE ${activePosition.side}</h2></div>
+                <div class="card-header"><h2 style="margin:0;"><span class="pulse-dot ${activePosition.side==='LONG'?'dot-green':'dot-red'}"></span> ACTIVE ${activePosition.side}</h2></div>
                 <div class="grid" style="margin-top:15px;">
                     <div class="stat-box"><span class="label">Entry</span><span class="value">$${(activePosition.entry || 0).toFixed(1)}</span></div>
                     <div class="stat-box"><span class="label">ROE %</span><span class="value ${activePosition.roe >= 0 ? 'text-green' : 'text-red'}">${(activePosition.roe || 0).toFixed(2)}%</span></div>
                     <div class="stat-box"><span class="label">PnL USD</span><span class="value ${activePosition.pnlUsd >= 0 ? 'text-green' : 'text-red'}">$${(activePosition.pnlUsd || 0).toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Size</span><span class="value">${activePosition.size || 0}</span></div>
+                    <div class="stat-box"><span class="label">Size / SL Status</span><span class="value">${activePosition.size} | ${activePosition.slMovedToBreakeven ? '<span class="text-yellow">BE HIT</span>' : 'Standard'}</span></div>
+                </div>
+                <div style="margin-top: 10px; font-size: 11px; color: var(--muted); background: rgba(0,0,0,0.3); padding: 5px; border-radius: 4px;">
+                    <strong>🤖 Co-Pilot Status:</strong> ${inTradeAiStatus}
                 </div>
             </div>`;
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V11.4 AI</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="10">
+            <!DOCTYPE html><html><head><title>Sniper AI Co-Pilot</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="10">
             <style>
-                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #a855f7; --yellow: #eab308; }
+                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; --yellow: #eab308; }
                 body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 15px; margin: 0; }
                 .container { max-width: 900px; margin: auto; }
                 .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
                 .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 15px; margin-bottom: 15px; }
                 .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; }
                 .stat-value { font-size: 18px; font-weight: 800; margin-top: 5px; }
-                .active-card { border-color: var(--blue); background: #1a1025; }
+                .active-card { border-color: var(--blue); background: #1a1e2d; }
                 .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
                 .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
                 .value { font-size: 14px; font-weight: 600; display: block; }
-                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); }
+                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); }
                 .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
-                .badge-green { background: rgba(16,185,129,0.2); color: var(--green); }
-                .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
-                table { width: 100%; border-collapse: collapse; }
-                th { text-align: left; font-size: 11px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); }
-                td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
-                .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
-                .dot-green { background: var(--green); } .dot-red { background: var(--red); }
+                .badge-green { background: rgba(16,185,129,0.2); color: var(--green); } .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
+                table { width: 100%; border-collapse: collapse; } th { text-align: left; font-size: 11px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); } td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+                .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; } .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
-                .ai-box { background: rgba(168, 85, 247, 0.05); padding: 12px; border-left: 3px solid var(--blue); border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; }
-                .memory-box { background: rgba(234, 179, 8, 0.05); border-left: 3px solid var(--yellow); padding: 12px; border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; }
+                .ai-box { padding: 12px; border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; border-left: 3px solid; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">SNIPER V11.4 AI EDITION</h2>
+                <h2 style="text-align:center; color:var(--purple); margin-top:5px; margin-bottom:20px;">SNIPER AI CO-PILOT (PRO)</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
-                    <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
+                    <div class="card"><div class="stat-title">Current Risk Allocation</div><div class="stat-value text-purple">${currentRiskPercent.toFixed(1)}% / Trade</div></div>
                     <div class="card"><div class="stat-title">Net Profit</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
                 </div>
                 ${activeCard}
                 
                 <div class="card">
-                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">AI Brain & Memory States</h3>
+                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">AI Brain & Strategy Overlays</h3>
                     
-                    <div class="ai-box">
-                        <strong>DNA Evolution (Tested Hourly):</strong><br/>
-                        <span style="color:var(--muted);">Last Evolved: ${dna.lastEvolved} | RSI: ${dna.rsiThreshold} | ATR: ${dna.atrMultiplier}x | RR: ${dna.rewardRatio}x</span><br/>
-                        <em>"${dna.aiReasoning}"</em>
+                    <div class="ai-box" style="border-color: var(--blue); background: rgba(59, 130, 246, 0.05);">
+                        <strong>End-Of-Day Master Shift:</strong><br/><em>"${eodStrategyShift}"</em>
                     </div>
                     
-                    <div class="ai-box" style="border-left-color: var(--green); background: rgba(16,185,129,0.05);">
-                        <strong>15m Macro Regime (Updated 30m):</strong><br/>
-                        <em>"${aiMacroRegime}"</em>
+                    <div class="ai-box" style="border-color: var(--green); background: rgba(16,185,129,0.05);">
+                        <strong>MTF Regime Confluence (15m/1H/4H):</strong><br/><em>"${aiMacroRegime}"</em>
                     </div>
 
-                    <div class="memory-box">
-                        <strong>AI Short-Term Memory (Post-Trade Lessons):</strong><br/>
-                        <ul style="margin: 5px 0; padding-left: 20px;">
-                            ${aiRecentLessons.map(lesson => `<li><em>${lesson}</em></li>`).join('')}
-                        </ul>
+                    <div class="ai-box" style="border-color: var(--red); background: rgba(239, 68, 68, 0.05);">
+                        <strong>Volume Anomaly Radar:</strong><br/><em>"${latestAnomaly}"</em>
+                    </div>
+
+                    <div class="ai-box" style="border-color: var(--yellow); background: rgba(234, 179, 8, 0.05);">
+                        <strong>AI Post-Trade Lessons:</strong><br/>
+                        <ul style="margin: 5px 0; padding-left: 20px;">${aiRecentLessons.map(l => `<li><em>${l}</em></li>`).join('')}</ul>
                     </div>
                 </div>
 
                 <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Live Technical Radar</h3>
-                    <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
-                        <div class="stat-box"><span class="label">1m RSI</span><span class="value ${latestRSI < dna.rsiThreshold + 5 || latestRSI > (100 - dna.rsiThreshold) - 5 ? 'text-yellow' : ''}">${latestRSI.toFixed(2)}</span></div>
-                        <div class="stat-box"><span class="label">Target LONG</span><span class="value text-green">< ${dna.rsiThreshold}</span></div>
-                        <div class="stat-box"><span class="label">Target SHORT</span><span class="value text-red">> ${100 - dna.rsiThreshold}</span></div>
-                        <div class="stat-box"><span class="label">100 SMA</span><span class="value">$${latestSMA.toFixed(2)}</span></div>
-                        <div class="stat-box"><span class="label">1m ATR Volatility</span><span class="value">$${latestATR.toFixed(4)}</span></div>
-                        <div class="stat-box"><span class="label">1H Trend Context</span><span class="value ${htfTrendIndicator === 'Bullish' ? 'text-green' : 'text-red'}">${htfTrendIndicator}</span></div>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Trade History (10 Recent)</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Trade History</h3>
                     <div style="overflow-x:auto;">
                         <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL USD</th><th>AI Score</th></tr>
-                        ${allTrades.map(t => {
-                            const pnlPct = Number(t.pnlPercent) || 0;
-                            const tradeTime = t.time ? new Date(t.time) : new Date();
-                            return `<tr>
-                                <td>${formatPHT(tradeTime)}</td>
+                        ${allTrades.map(t => `<tr>
+                                <td>${formatPHT(t.time)}</td>
                                 <td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td>
-                                <td class="${pnlPct>=0?'text-green':'text-red'}">${pnlPct.toFixed(2)}%</td>
-                                <td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
+                                <td class="${(t.pnlPercent||0)>=0?'text-green':'text-red'}">${(t.pnlPercent||0).toFixed(2)}%</td>
+                                <td class="${(t.pnlUsd||0)>=0?'text-green':'text-red'}">$${(t.pnlUsd||0).toFixed(2)}</td>
                                 <td>${t.aiConfidence ? t.aiConfidence+'%' : 'N/A'}</td>
-                            </tr>`
-                        }).join('')}
+                            </tr>`).join('')}
                         </table>
                     </div>
                 </div>
@@ -564,24 +526,23 @@ app.get('/', async (req, res) => {
 });
 
 // ==========================================
-// STARTUP
+// STARTUP SCHEDULER
 // ==========================================
 async function start() {
     try {
         const markets = await mexc.loadMarkets();
         contractSize = markets[SYMBOL].contractSize || 0.0001;
-        const b = await mexc.fetchBalance();
-        walletBalance = b.total['USDT'] || 0;
+        const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0;
         
         await analyzeMarketState(); 
         setTimeout(async () => { await evolve(); }, 3000); 
+        await sendNotification(`AI Co-Pilot Online.`);
         
-        await sendNotification(`System Started & AI Architecture Online.`);
-        
-        setInterval(tick, 5000);           
-        setInterval(analyzeMarketState, 1800000); 
-        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000);     
-        setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {} }, 30000);                          
+        setInterval(tick, 5000); // 5 sec       
+        setInterval(analyzeMarketState, 900000); // 15 mins (MTF & Risk)
+        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // 1 hr (Evolution)
+        setInterval(eodDebrief, 86400000); // 24 hrs (EOD Debrief)
+        setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e){} }, 30000);                          
         
     } catch (e) { console.error(e); setTimeout(start, 10000); }
 }
