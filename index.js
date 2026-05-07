@@ -52,6 +52,10 @@ let contractSize = 0.0001;
 let lastOrderTime = 0; 
 let activePosition = null;
 
+// NEW AI MEMORY STATES
+let aiMacroRegime = "Awaiting initial analysis...";
+let aiRecentLessons = ["No recent trades to analyze."];
+
 // Helper: Format to Philippine Time (PHT)
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
@@ -69,7 +73,7 @@ async function sendNotification(message) {
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: `🎯 **Sniper V11.3 (AI Edition)**\n${message}` })
+            body: JSON.stringify({ content: `🎯 **Sniper V11.4 (AI Edition)**\n${message}` })
         });
     } catch (e) { console.error("Notification Error:", e.message); }
 }
@@ -96,7 +100,65 @@ async function pruneDatabase() {
 }
 
 // ==========================================
-// EVOLUTION ENGINE WITH AI FILTER
+// AI PILLAR 2: MACRO REGIME ANALYSIS
+// ==========================================
+async function analyzeMarketState() {
+    try {
+        // Fetch 15-minute candles for Macro view
+        const ohlcv15m = await mexc.fetchOHLCV(SYMBOL, '15m', undefined, 100);
+        const closes = ohlcv15m.map(c => c[4]);
+        
+        const rsi15 = RSI.calculate({ period: 14, values: closes }).pop();
+        const sma50 = SMA.calculate({ period: 50, values: closes }).pop();
+        const price = closes[closes.length - 1];
+
+        const prompt = `
+        You are the Head Market Analyst for a crypto trading desk. 
+        Analyze the 15-minute timeframe for ${SYMBOL}.
+        Current Price: $${price} | 15m SMA(50): $${sma50.toFixed(2)} | 15m RSI: ${rsi15.toFixed(2)}.
+        Determine the overarching market regime (e.g., Choppy, Trending Bullish, Overextended Bearish).
+        Use this exact JSON schema: {"regime": "1-3 word description", "advice": "One sentence tip for 1-minute scalping right now."}`;
+
+        const result = await aiModel.generateContent(prompt);
+        const responseText = result.response.text().trim();
+        const aiDecision = JSON.parse(responseText);
+
+        aiMacroRegime = `${aiDecision.regime} - ${aiDecision.advice}`;
+        console.log(`🌐 Macro State Updated: ${aiMacroRegime}`);
+    } catch (e) {
+        console.error("Macro Analysis Error:", e.message);
+    }
+}
+
+// ==========================================
+// AI PILLAR 4: POST-TRADE REFLECTION
+// ==========================================
+async function postTradeReflection(tradeData) {
+    try {
+        const prompt = `
+        A 1-minute scalp trade just closed on ${SYMBOL}.
+        Side: ${tradeData.side} | Entry: $${tradeData.entry} | Exit: $${tradeData.exit} | PnL: ${tradeData.pnlPercent.toFixed(2)}%.
+        AI Confidence on entry was: ${tradeData.aiConfidence}%.
+        Provide a 1-sentence lesson learned from this trade to improve future entries or risk management.
+        Use this exact JSON schema: {"lesson": "your 1 sentence lesson"}`;
+
+        const result = await aiModel.generateContent(prompt);
+        const responseText = result.response.text().trim();
+        const aiDecision = JSON.parse(responseText);
+
+        // Add to memory, keep only the last 3 lessons to save tokens
+        if (aiRecentLessons[0] === "No recent trades to analyze.") aiRecentLessons.shift();
+        aiRecentLessons.push(`[${tradeData.pnlPercent > 0 ? 'WIN' : 'LOSS'}] ${aiDecision.lesson}`);
+        if (aiRecentLessons.length > 3) aiRecentLessons.shift();
+
+        console.log(`🧠 AI Learned: ${aiDecision.lesson}`);
+    } catch (e) {
+        console.error("Post-Trade Reflection Error:", e.message);
+    }
+}
+
+// ==========================================
+// AI PILLAR 1: EVOLUTION ENGINE
 // ==========================================
 async function evolve() {
     try {
@@ -108,7 +170,7 @@ async function evolve() {
         const rsiV = RSI.calculate({ period: 14, values: closes });
         const atrV = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
         const smaV = SMA.calculate({ period: 200, values: closes });
-        const sma60V = SMA.calculate({ period: 60, values: closes }); // 1H Trend Context
+        const sma60V = SMA.calculate({ period: 60, values: closes }); 
 
         const offsetRSI = closes.length - rsiV.length;
         const offsetSMA = closes.length - smaV.length;
@@ -150,7 +212,6 @@ async function evolve() {
         };
 
         let results =[];
-        // Expanded array to allow true AI DNA mutation
         for (let r of [25, 30, 35, 40]) {
             for (let a of [1.5, 2.0, 2.5]) {
                 for (let rr of [1.5, 2.0, 2.5, 3.0]) {
@@ -172,14 +233,14 @@ async function evolve() {
 
         try {
             const prompt = `
-            You are a crypto quantitative analyst. We backtested parameters on 1m BTC data. 
-            Current Context: 1m Trend is ${trend}, 1H Trend is ${htfTrend}, Price: $${currentPrice}, Volatility (ATR): $${currentATR.toFixed(2)}.
-            Here are the top 3 parameter sets based on net score:
+            You are a crypto quantitative analyst evaluating 1-minute BTC parameters.
+            Current 1m Trend: ${trend} | 1H Trend: ${htfTrend} | Price: $${currentPrice} | Volatility: $${currentATR.toFixed(2)}.
+            Top 3 parameter sets by net backtest score:
             1. RSI: ${top3[0].rsiThreshold}, ATRx: ${top3[0].atrMultiplier}, RR: ${top3[0].rewardRatio}, Score: ${top3[0].score.toFixed(4)}, Trades: ${top3[0].tradesCount}
             2. RSI: ${top3[1].rsiThreshold}, ATRx: ${top3[1].atrMultiplier}, RR: ${top3[1].rewardRatio}, Score: ${top3[1].score.toFixed(4)}, Trades: ${top3[1].tradesCount}
             3. RSI: ${top3[2].rsiThreshold}, ATRx: ${top3[2].atrMultiplier}, RR: ${top3[2].rewardRatio}, Score: ${top3[2].score.toFixed(4)}, Trades: ${top3[2].tradesCount}
-            Select the best set (1, 2, or 3) that provides a balance of profitability and safety (avoiding curve-fitting).
-            Use this exact JSON schema for your response: {"selection": 1, "reasoning": "your short explanation"}`;
+            Select the best set (1, 2, or 3) to avoid curve-fitting.
+            Use exact JSON schema: {"selection": 1, "reasoning": "short explanation"}`;
 
             const result = await aiModel.generateContent(prompt);
             const responseText = result.response.text().trim();
@@ -191,22 +252,22 @@ async function evolve() {
                 rewardRatio: selected.rewardRatio, lastEvolved: formatPHT(new Date()),
                 aiReasoning: aiDecision.reasoning
             };
-            console.log(`🧬 AI Evolved DNA. Selected Option ${aiDecision.selection}: ${aiDecision.reasoning}`);
+            console.log(`🧬 DNA Evolved. Selection ${aiDecision.selection}: ${aiDecision.reasoning}`);
         } catch (aiErr) {
-            console.error("AI Evolution Error, falling back to top score. DETAILS:", aiErr.message);
+            console.error("Evolution AI Error. Fallback to top score.");
             dna = { ...top3[0], lastEvolved: formatPHT(new Date()), aiReasoning: "Fallback to highest backtest score (AI failed)." };
         }
     } catch (e) { console.error("Evolution Error:", e.message); }
 }
 
 // ==========================================
-// TRADING TICKER WITH AI VALIDATION
+// AI PILLAR 3: TRADING TICKER & VALIDATION
 // ==========================================
 async function tick() {
     if (isTrading) return;
     isTrading = true;
     try {
-        const [ticker, pos, ohlcv] = await Promise.all([
+        const[ticker, pos, ohlcv] = await Promise.all([
             mexc.fetchTicker(SYMBOL),
             mexc.fetchPositions([SYMBOL]),
             mexc.fetchOHLCV(SYMBOL, TIMEFRAME, undefined, 250)
@@ -239,13 +300,18 @@ async function tick() {
                 finalRoe = (diff / activePosition.entry) * LEVERAGE * 100;
             }
 
-            await Trade.create({ 
+            const tradeToSave = { 
                 side: activePosition.side, entry: activePosition.entry, exit: price, 
                 pnlUsd: finalPnlUsd, pnlPercent: finalRoe, equityAfter: walletBalance + finalPnlUsd, 
                 isWin: finalPnlUsd > 0, time: new Date(), aiConfidence: activePosition.aiConfidence || 0
-            });
+            };
 
-            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            await Trade.create(tradeToSave);
+            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            
+            // Trigger Post-Trade AI Reflection (Does not block tick)
+            postTradeReflection(tradeToSave);
+            
             activePosition = null;
 
         } else if (Date.now() - lastOrderTime > 60000) {
@@ -254,7 +320,7 @@ async function tick() {
             
             const rsi = RSI.calculate({ period: 14, values: closes }).pop();
             const sma = SMA.calculate({ period: 200, values: closes }).pop();
-            const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); // 1H HTF Context
+            const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); 
             const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
 
             let action = null; let orderSide = null;
@@ -267,12 +333,15 @@ async function tick() {
 
                 try {
                     const prompt = `
-                    You are a risk management AI for a crypto sniper bot. A technical signal fired for ${SYMBOL}.
-                    Action: ${action} | Current Price: $${price} 
-                    1m SMA(200): $${sma.toFixed(2)} | 1H SMA(60-min): $${sma60.toFixed(2)} (HTF Trend is ${htfTrend})
+                    You are the ultimate crypto risk manager. A ${action} signal fired for 1m ${SYMBOL}.
+                    Price: $${price} | 1m SMA(200): $${sma.toFixed(2)} | 1H Trend: ${htfTrend}
                     1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
-                    Based strictly on price action, mean-reversion logic, and the higher timeframe trend context, validate this trade. 
-                    Use this exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
+                    
+                    MACRO REGIME CONTEXT: ${aiMacroRegime}
+                    RECENT AI MEMORY (Lessons from past trades): ${aiRecentLessons.join(" | ")}
+                    
+                    Based on technicals, macro regime, and past lessons, validate this trade. 
+                    Use exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                     
                     const result = await aiModel.generateContent(prompt);
                     const responseText = result.response.text().trim();
@@ -280,7 +349,7 @@ async function tick() {
 
                     aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
                 } catch (e) { 
-                    console.error("AI Pre-trade validation failed. DETAILS:", e.message); 
+                    console.error("AI Validation Error:", e.message); 
                 }
 
                 if (aiApproved && aiConfidence >= 50) {
@@ -300,7 +369,7 @@ async function tick() {
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence }; 
 
-                        await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nPrice: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\nSL: $${sl.toFixed(2)} | TP: $${tp.toFixed(2)}\n🧠 **AI Confidence:** ${aiConfidence}%\n💬 **AI Notes:** ${aiNotes}`);
+                        await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nPrice: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 **AI Confidence:** ${aiConfidence}%\n💬 **Notes:** ${aiNotes}`);
                     }
                 } else {
                     console.log(`🤖 AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
@@ -347,11 +416,11 @@ app.get('/', async (req, res) => {
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V11.3 AI</title>
+            <!DOCTYPE html><html><head><title>Elite Sniper V11.4 AI</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="refresh" content="5">
+            <meta http-equiv="refresh" content="10">
             <style>
-                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #a855f7; }
+                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #a855f7; --yellow: #eab308; }
                 body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 15px; margin: 0; }
                 .container { max-width: 900px; margin: auto; }
                 .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
@@ -372,11 +441,12 @@ app.get('/', async (req, res) => {
                 .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
                 .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
-                .ai-reasoning { background: rgba(168, 85, 247, 0.1); padding: 10px; border-left: 3px solid var(--blue); border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.5; }
+                .ai-box { background: rgba(168, 85, 247, 0.05); padding: 12px; border-left: 3px solid var(--blue); border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; }
+                .memory-box { background: rgba(234, 179, 8, 0.05); border-left: 3px solid var(--yellow); padding: 12px; border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🧠 SNIPER V11.3 AI EDITION</h2>
+                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🧠 SNIPER V11.4 AI EDITION</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -384,14 +454,29 @@ app.get('/', async (req, res) => {
                     <div class="card"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
                 </div>
                 ${activeCard}
+                
                 <div class="card">
-                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">Current AI DNA Status</h3>
-                    <div class="ai-reasoning">
-                        <strong>Last Evolved:</strong> ${dna.lastEvolved}<br/>
-                        <strong>Selected Params:</strong> RSI Threshold: ${dna.rsiThreshold} | ATR Multiplier: ${dna.atrMultiplier}x | Reward Ratio: ${dna.rewardRatio}x<br/>
-                        <strong style="color:var(--text);">AI Rationale:</strong> "${dna.aiReasoning}"
+                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">🧠 AI Brain & Memory States</h3>
+                    
+                    <div class="ai-box">
+                        <strong>🧬 DNA Evolution (Tested Hourly):</strong><br/>
+                        <span style="color:var(--muted);">Last Evolved: ${dna.lastEvolved} | RSI: ${dna.rsiThreshold} | ATR: ${dna.atrMultiplier}x | RR: ${dna.rewardRatio}x</span><br/>
+                        <em>"${dna.aiReasoning}"</em>
+                    </div>
+                    
+                    <div class="ai-box" style="border-left-color: var(--green); background: rgba(16,185,129,0.05);">
+                        <strong>🌐 15m Macro Regime (Updated 30m):</strong><br/>
+                        <em>"${aiMacroRegime}"</em>
+                    </div>
+
+                    <div class="memory-box">
+                        <strong>💡 AI Short-Term Memory (Post-Trade Lessons):</strong><br/>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            ${aiRecentLessons.map(lesson => `<li><em>${lesson}</em></li>`).join('')}
+                        </ul>
                     </div>
                 </div>
+
                 <div class="card">
                     <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Trade History (10 Recent)</h3>
                     <div style="overflow-x:auto;">
@@ -424,17 +509,20 @@ async function start() {
         const b = await mexc.fetchBalance();
         walletBalance = b.total['USDT'] || 0;
         
-        await evolve(); 
-        await sendNotification(`System Started & Initial DNA Evolved by AI.`);
+        // Stagger startup calls to respect burst rate limits
+        await analyzeMarketState(); 
+        setTimeout(async () => { await evolve(); }, 3000); 
+        
+        await sendNotification(`System Started & AI Architecture Online.`);
         
         setInterval(tick, 10000);           
-        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000);       
+        setInterval(analyzeMarketState, 1800000); // Every 30 mins
+        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // Every 1 hour      
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {} }, 30000);                          
         
     } catch (e) { console.error(e); setTimeout(start, 10000); }
 }
 
-// Bind strictly to 0.0.0.0 for Render compatibility
 app.listen(port, "0.0.0.0", () => {
     console.log(`Server running on port ${port}`);
     start();
