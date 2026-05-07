@@ -9,11 +9,11 @@ const app = express();
 const port = process.env.PORT || 10000;
 
 // ==========================================
-// GEMINI AI SETUP (STABLE PRODUCTION ROUTE)
+// GEMINI AI SETUP (RESTORED TO WORKING MODEL)
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = genAI.getGenerativeModel({ 
-    model: "gemini-1.5-flash", // Official production endpoint
+    model: "gemini-2.5-flash", 
     generationConfig: {
         responseMimeType: "application/json",
     }
