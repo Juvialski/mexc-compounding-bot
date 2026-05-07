@@ -21,7 +21,7 @@ const TIMEFRAME = '1m';
 const LEVERAGE = 10;
 const RISK_PERCENT = 5.0; 
 const TAKER_FEE = 0.0006;
-const SIMULATED_SLIPPAGE = 0.0005; // 0.05% extra penalty in backtests 
+const SIMULATED_SLIPPAGE = 0.0005; 
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -174,14 +174,12 @@ async function tick() {
         lastTicker = ticker;
         const price = Number(ticker.last || 0);
         
-        // Flexible parsing for CCXT changes in how they return size
         const rawPos = pos.find(p => p.symbol === SYMBOL && (parseFloat(p.contracts) > 0 || parseFloat(p.amount) > 0 || parseFloat(p.info?.position) > 0));
 
         if (rawPos) {
             const side = rawPos.side.toUpperCase();
             const entryPrice = Number(rawPos.entryPrice || rawPos.price || rawPos.average || 0);
             
-            // Resolve exact contracts quantity
             let contracts = Number(rawPos.contracts || rawPos.amount || 0);
             if (contracts === 0 && rawPos.info && rawPos.info.position) {
                 contracts = Number(rawPos.info.position);
@@ -190,7 +188,6 @@ async function tick() {
             const isLong = side === 'LONG';
             const pnlUsd = (isLong ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
 
-            // Pure Math ROE (Does not require position size to calculate)
             let roe = 0;
             if (entryPrice > 0) {
                 const diff = isLong ? (price - entryPrice) : (entryPrice - price);
@@ -203,13 +200,13 @@ async function tick() {
             const isLong = activePosition.side === 'LONG';
             const finalPnlUsd = (isLong ? (price - activePosition.entry) : (activePosition.entry - price)) * activePosition.size * contractSize;
             
-            // Pure Math ROE
             let finalRoe = 0;
             if (activePosition.entry > 0) {
                 const diff = isLong ? (price - activePosition.entry) : (activePosition.entry - price);
                 finalRoe = (diff / activePosition.entry) * LEVERAGE * 100;
             }
 
+            // Fixed Timestamp saving logic
             await Trade.create({ 
                 side: activePosition.side, 
                 entry: activePosition.entry, 
@@ -218,7 +215,7 @@ async function tick() {
                 pnlPercent: finalRoe, 
                 equityAfter: walletBalance + finalPnlUsd, 
                 isWin: finalPnlUsd > 0,
-                time: new Date() // Fixes the exact trade closure timestamp!
+                time: new Date() 
             });
 
             await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
@@ -265,6 +262,24 @@ async function tick() {
 }
 
 // ==========================================
+// HIDDEN DB RESET ROUTE
+// ==========================================
+app.get('/reset-db', async (req, res) => {
+    try {
+        await Trade.deleteMany({});
+        res.send(`
+            <div style="background:#0b0f19; color:#10b981; font-family:sans-serif; text-align:center; padding:50px;">
+                <h2>✅ Database Successfully Cleared!</h2>
+                <p>All old history has been wiped. Net profit and Win Rate are reset to 0.</p>
+                <a href="/" style="color:#3b82f6; text-decoration:none; font-size:18px;">Click here to return to your Dashboard</a>
+            </div>
+        `);
+    } catch (e) {
+        res.send(`<div style="color:red; text-align:center; padding:20px; font-family:sans-serif;">Error clearing database: ${e.message}</div>`);
+    }
+});
+
+// ==========================================
 // DASHBOARD UI
 // ==========================================
 app.get('/', async (req, res) => {
@@ -279,7 +294,6 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        // USING .lean() IS CRITICAL. It strips Mongoose protections and returns pure JSON arrays!
         const allTrades = await Trade.find().sort({ time: -1 }).limit(10).lean();
         const totalPnl = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
         const winCount = await Trade.countDocuments({ isWin: true });
@@ -304,7 +318,7 @@ app.get('/', async (req, res) => {
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V11</title>
+            <!DOCTYPE html><html><head><title>Elite Sniper V11.1</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta http-equiv="refresh" content="5">
             <style>
@@ -333,7 +347,7 @@ app.get('/', async (req, res) => {
                 @media (max-width: 600px) { .grid { grid-template-columns: repeat(2, 1fr); } .card { padding: 12px; } .stat-value { font-size: 16px; } th, td { font-size: 11px; padding: 6px; } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🎯 SNIPER V11 (PHT)</h2>
+                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🎯 SNIPER V11.1 (PHT)</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -346,15 +360,7 @@ app.get('/', async (req, res) => {
                     <div style="overflow-x:auto;">
                         <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL USD</th></tr>
                         ${allTrades.map(t => {
-                            let pnlPct = Number(t.pnlPercent) || 0;
-                            
-                            // Pure Math Fallback (If old data has 0.00 saved in DB)
-                            if (pnlPct === 0 && t.entry && t.exit && t.entry > 0) {
-                                const diff = t.side === 'LONG' ? (t.exit - t.entry) : (t.entry - t.exit);
-                                pnlPct = (diff / t.entry) * LEVERAGE * 100;
-                            }
-
-                            // Ensures old trades don't display 'Current Time'
+                            const pnlPct = Number(t.pnlPercent) || 0;
                             const tradeTime = t.time ? new Date(t.time) : new Date();
 
                             return `<tr>
