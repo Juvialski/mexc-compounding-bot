@@ -26,14 +26,22 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             const result = await aiModel.generateContent(prompt);
-            const responseText = result.response.text().trim();
+            let responseText = result.response.text().trim();
+            
+            // Strip markdown formatting if Gemini adds it
+            if (responseText.startsWith('```json')) {
+                responseText = responseText.replace(/^```json/, '').replace(/```$/, '').trim();
+            } else if (responseText.startsWith('```')) {
+                responseText = responseText.replace(/^```/, '').replace(/```$/, '').trim();
+            }
+
             return JSON.parse(responseText);
         } catch (error) {
             const is503 = error.message && error.message.includes('503');
             
             if (is503 && attempt < maxRetries) {
                 const delay = baseDelayMs * attempt; 
-                console.warn(`⚠️ Gemini API 503 Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
+                console.warn(`Gemini API 503 Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
             } else {
                 throw error; 
@@ -102,7 +110,7 @@ async function sendNotification(message) {
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: `🎯 Sniper V11.4 (AI Edition)\n${message}` })
+            body: JSON.stringify({ content: `Sniper V11.4 (AI Edition)\n${message}` })
         });
     } catch (e) { console.error("Notification Error:", e.message); }
 }
@@ -112,8 +120,8 @@ async function sendNotification(message) {
 // ==========================================
 let dbStatus = "Connecting...";
 mongoose.connect(process.env.MONGO_URI)
-    .then(() => { dbStatus = "Connected"; console.log("✅ DB Connected"); })
-    .catch(err => { dbStatus = "Error connecting to DB"; console.error("❌ DB ERROR:", err); });
+    .then(() => { dbStatus = "Connected"; console.log("DB Connected"); })
+    .catch(err => { dbStatus = "Error connecting to DB"; console.error("DB ERROR:", err); });
 
 const Trade = mongoose.model('Trade', new mongoose.Schema({
     side: String, entry: Number, exit: Number, pnlUsd: Number, pnlPercent: Number, 
@@ -150,7 +158,7 @@ async function analyzeMarketState() {
         const aiDecision = await askAIWithRetry(prompt);
 
         aiMacroRegime = `${aiDecision.regime} - ${aiDecision.advice}`;
-        console.log(`🌐 Macro State Updated: ${aiMacroRegime}`);
+        console.log(`Macro State Updated: ${aiMacroRegime}`);
     } catch (e) {
         console.error("Macro Analysis Error:", e.message);
     }
@@ -174,7 +182,7 @@ async function postTradeReflection(tradeData) {
         aiRecentLessons.push(`[${tradeData.pnlPercent > 0 ? 'WIN' : 'LOSS'}] ${aiDecision.lesson}`);
         if (aiRecentLessons.length > 3) aiRecentLessons.shift();
 
-        console.log(`🧠 AI Learned: ${aiDecision.lesson}`);
+        console.log(`AI Learned: ${aiDecision.lesson}`);
     } catch (e) {
         console.error("Post-Trade Reflection Error:", e.message);
     }
@@ -283,9 +291,10 @@ async function evolve() {
                 rewardRatio: selected.rewardRatio, lastEvolved: formatPHT(new Date()),
                 aiReasoning: aiDecision.reasoning
             };
-            console.log(`🧬 DNA Evolved. Selection ${aiDecision.selection}: ${aiDecision.reasoning}`);
+            console.log(`DNA Evolved. Selection ${aiDecision.selection}: ${aiDecision.reasoning}`);
         } catch (aiErr) {
-            console.error("Evolution AI Error. Fallback to top score.");
+            console.error("Evolution AI Error Details:", aiErr.message);
+            console.error("Fallback to top score.");
             dna = { ...top3[0], lastEvolved: formatPHT(new Date()), aiReasoning: "Fallback to highest backtest score (AI failed)." };
         }
     } catch (e) { console.error("Evolution Error:", e.message); }
@@ -338,7 +347,7 @@ async function tick() {
             };
 
             await Trade.create(tradeToSave);
-            await sendNotification(`Position Closed 🏁\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            await sendNotification(`Position Closed\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             
             postTradeReflection(tradeToSave);
             activePosition = null;
@@ -412,10 +421,10 @@ async function tick() {
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence }; 
 
-                        await sendNotification(`New Position Opened 🚀\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 AI Confidence: ${aiConfidence}%\n💬 Notes: ${aiNotes}`);
+                        await sendNotification(`New Position Opened\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
                     }
                 } else {
-                    console.log(`🤖 AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
+                    console.log(`AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
                     lastOrderTime = Date.now() - 30000; 
                 }
             }
@@ -428,7 +437,7 @@ async function tick() {
 // ROUTES & UI
 // ==========================================
 app.get('/reset-db', async (req, res) => {
-    try { await Trade.deleteMany({}); res.send(`<h2>✅ Database Cleared!</h2>`); } 
+    try { await Trade.deleteMany({}); res.send(`<h2>Database Cleared!</h2>`); } 
     catch (e) { res.send(`Error: ${e.message}`); }
 });
 
@@ -489,7 +498,7 @@ app.get('/', async (req, res) => {
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🧠 SNIPER V11.4 AI EDITION</h2>
+                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">SNIPER V11.4 AI EDITION</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -499,21 +508,21 @@ app.get('/', async (req, res) => {
                 ${activeCard}
                 
                 <div class="card">
-                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">🧠 AI Brain & Memory States</h3>
+                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">AI Brain & Memory States</h3>
                     
                     <div class="ai-box">
-                        <strong>🧬 DNA Evolution (Tested Hourly):</strong><br/>
+                        <strong>DNA Evolution (Tested Hourly):</strong><br/>
                         <span style="color:var(--muted);">Last Evolved: ${dna.lastEvolved} | RSI: ${dna.rsiThreshold} | ATR: ${dna.atrMultiplier}x | RR: ${dna.rewardRatio}x</span><br/>
                         <em>"${dna.aiReasoning}"</em>
                     </div>
                     
                     <div class="ai-box" style="border-left-color: var(--green); background: rgba(16,185,129,0.05);">
-                        <strong>🌐 15m Macro Regime (Updated 30m):</strong><br/>
+                        <strong>15m Macro Regime (Updated 30m):</strong><br/>
                         <em>"${aiMacroRegime}"</em>
                     </div>
 
                     <div class="memory-box">
-                        <strong>💡 AI Short-Term Memory (Post-Trade Lessons):</strong><br/>
+                        <strong>AI Short-Term Memory (Post-Trade Lessons):</strong><br/>
                         <ul style="margin: 5px 0; padding-left: 20px;">
                             ${aiRecentLessons.map(lesson => `<li><em>${lesson}</em></li>`).join('')}
                         </ul>
@@ -521,7 +530,7 @@ app.get('/', async (req, res) => {
                 </div>
 
                 <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">📡 Live Technical Radar</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Live Technical Radar</h3>
                     <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
                         <div class="stat-box"><span class="label">1m RSI</span><span class="value ${latestRSI < dna.rsiThreshold + 5 || latestRSI > (100 - dna.rsiThreshold) - 5 ? 'text-yellow' : ''}">${latestRSI.toFixed(2)}</span></div>
                         <div class="stat-box"><span class="label">Target LONG</span><span class="value text-green">< ${dna.rsiThreshold}</span></div>
