@@ -28,7 +28,6 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
             const result = await aiModel.generateContent(prompt);
             let responseText = result.response.text().trim();
             
-            // Strip markdown formatting if Gemini adds it
             if (responseText.startsWith('```json')) {
                 responseText = responseText.replace(/^```json/, '').replace(/```$/, '').trim();
             } else if (responseText.startsWith('```')) {
@@ -38,10 +37,11 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
             return JSON.parse(responseText);
         } catch (error) {
             const is503 = error.message && error.message.includes('503');
+            const is429 = error.message && error.message.includes('429');
             
-            if (is503 && attempt < maxRetries) {
-                const delay = baseDelayMs * attempt; 
-                console.warn(`Gemini API 503 Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
+            if ((is503 || is429) && attempt < maxRetries) {
+                const delay = is429 ? 60000 : baseDelayMs * attempt; 
+                console.warn(`Gemini API Rate Limit or Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
             } else {
                 throw error; 
