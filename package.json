@@ -10,7 +10,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.1.2",
+    "@google/generative-ai": "latest",
     "ccxt": "^4.3.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
