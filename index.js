@@ -9,11 +9,11 @@ const app = express();
 const port = process.env.PORT || 10000;
 
 // ==========================================
-// GEMINI AI SETUP (RESTORED TO WORKING MODEL)
+// GEMINI AI SETUP
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = genAI.getGenerativeModel({ 
-    model: "gemini-3.1-flash-lite", 
+    model: "gemini-3.1-flash-lite-preview", 
     generationConfig: {
         responseMimeType: "application/json",
     }
