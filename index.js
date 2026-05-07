@@ -1,3 +1,6 @@
+// ==========================================
+// Paste May 07, 2026 - UPGRADED AI EDITION (WITH LIVE RADAR RESTORED)
+// ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
 const express = require('express');
@@ -163,7 +166,6 @@ async function analyzeMarketState() {
         const m1 = getStats(ohlcv1m); const m15 = getStats(ohlcv15m);
         const h1 = getStats(ohlcv1h); const h4 = getStats(ohlcv4h);
 
-        // Calculate Win Rate for dynamic risk sizing
         const recentTrades = await Trade.find().sort({ time: -1 }).limit(10);
         const wins = recentTrades.filter(t => t.isWin).length;
         const winRate = recentTrades.length > 0 ? (wins / recentTrades.length) * 100 : 50;
@@ -259,7 +261,7 @@ async function evolve() {
 }
 
 // ==========================================
-// CORE TRADING TICKER (WITH NEW AI PILLARS)
+// CORE TRADING TICKER
 // ==========================================
 async function tick() {
     if (isTrading) return;
@@ -285,6 +287,11 @@ async function tick() {
         latestRSI = rsi; latestSMA = sma100; latestATR = atr;
         htfTrendIndicator = price > sma60 ? "Bullish" : "Bearish";
 
+        // Console log for watching target (from original code)
+        if (!activePosition && (rsi < dna.rsiThreshold + 10 || rsi > (100 - dna.rsiThreshold) - 10)) {
+            console.log(`[WATCHING] Price: $${price} | 1m SMA100: $${sma100.toFixed(2)} | 1m RSI: ${rsi.toFixed(2)} | Target: <${dna.rsiThreshold} or >${100 - dna.rsiThreshold}`);
+        }
+
         // --- IMPROVEMENT 4: VOLUME ANOMALY DETECTOR ---
         if (!activePosition && currentVol > (volSMA * 3.5) && Date.now() > volumeAnomalyCooldown) {
             console.log("Volume Anomaly Detected! Asking AI...");
@@ -297,13 +304,12 @@ async function tick() {
                 
                 const aiDecision = await askAIWithRetry(prompt, 1, 1000);
                 latestAnomaly = `Detected at ${formatPHT(new Date())} - ${aiDecision.advice}`;
-                volumeAnomalyCooldown = Date.now() + (15 * 60 * 1000); // 15m cooldown
+                volumeAnomalyCooldown = Date.now() + (15 * 60 * 1000); 
             } catch (e) { console.error("Anomaly AI failed."); }
         }
 
         const rawPos = pos.find(p => p.symbol === SYMBOL && (parseFloat(p.contracts) > 0 || parseFloat(p.amount) > 0 || parseFloat(p.info?.position) > 0));
 
-        // --- EXISTING POSITION LOGIC & IMPROVEMENT 1: IN-TRADE CO-PILOT ---
         if (rawPos) {
             const side = rawPos.side.toUpperCase();
             const entryPrice = Number(rawPos.entryPrice || rawPos.price || rawPos.average || 0);
@@ -311,22 +317,19 @@ async function tick() {
             const pnlUsd = (side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
             const roe = (entryPrice > 0) ? ((side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) / entryPrice) * LEVERAGE * 100 : 0;
             
-            // Preserve internal breakeven state if it exists
             const slMoved = activePosition?.slMovedToBreakeven || false;
             activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe, aiConfidence: activePosition?.aiConfidence || 100, slMovedToBreakeven: slMoved };
 
-            // Internal Breakeven Trigger
             if (activePosition.slMovedToBreakeven) {
                 if ((side === 'LONG' && price <= entryPrice) || (side === 'SHORT' && price >= entryPrice)) {
                     console.log("Internal Breakeven SL Hit. Closing via Market Order...");
                     await mexc.cancelAllOrders(SYMBOL);
                     await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
                     inTradeAiStatus = "Closed at Breakeven.";
-                    return; // exit tick, handle DB save on next tick
+                    return; 
                 }
             }
 
-            // AI In-Trade Check (Every 3 minutes)
             if (Date.now() - lastInTradeCheck > 180000) {
                 lastInTradeCheck = Date.now();
                 try {
@@ -350,13 +353,12 @@ async function tick() {
                         await sendNotification(`AI Intervened: Closed Early. Reason: ${aiDecision.reason}`);
                     } else if (aiDecision.action === "MOVE_SL_BREAKEVEN" && !activePosition.slMovedToBreakeven) {
                         activePosition.slMovedToBreakeven = true;
-                        await mexc.cancelAllOrders(SYMBOL); // Cancel limit SL to rely on our internal breakeven trigger
+                        await mexc.cancelAllOrders(SYMBOL); 
                         await sendNotification(`AI Intervened: Stop Loss moved to Breakeven. Reason: ${aiDecision.reason}`);
                     }
                 } catch(e) { console.error("In-Trade AI Check Failed."); }
             }
 
-        // --- POSITION CLOSED LOGIC ---
         } else if (activePosition && !rawPos) {
             const finalRoe = (activePosition.entry > 0) ? (((activePosition.side === 'LONG' ? (price - activePosition.entry) : (activePosition.entry - price)) / activePosition.entry) * LEVERAGE * 100) : 0;
             const tradeToSave = { 
@@ -371,7 +373,6 @@ async function tick() {
             inTradeAiStatus = "No active trade.";
             lastInTradeCheck = 0;
 
-        // --- SIGNAL DETECTION & VALIDATION ---
         } else if (Date.now() - lastOrderTime > 60000) {
             let action = null; let orderSide = null;
             if (price > sma100 && rsi < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
@@ -460,6 +461,7 @@ app.get('/', async (req, res) => {
                 body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 15px; margin: 0; }
                 .container { max-width: 900px; margin: auto; }
                 .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+                .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
                 .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 15px; margin-bottom: 15px; }
                 .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; }
                 .stat-value { font-size: 18px; font-weight: 800; margin-top: 5px; }
@@ -480,11 +482,23 @@ app.get('/', async (req, res) => {
                 <h2 style="text-align:center; color:var(--purple); margin-top:5px; margin-bottom:20px;">SNIPER AI CO-PILOT (PRO)</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
-                    <div class="card"><div class="stat-title">Current Risk Allocation</div><div class="stat-value text-purple">${currentRiskPercent.toFixed(1)}% / Trade</div></div>
+                    <div class="card"><div class="stat-title">Risk Allocation</div><div class="stat-value text-purple">${currentRiskPercent.toFixed(1)}% / Trade</div></div>
                     <div class="card"><div class="stat-title">Net Profit</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
                 </div>
                 ${activeCard}
+
+                <div class="card">
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Live Technical Radar</h3>
+                    <div class="grid-3">
+                        <div class="stat-box"><span class="label">1m RSI</span><span class="value ${latestRSI < dna.rsiThreshold + 5 || latestRSI > (100 - dna.rsiThreshold) - 5 ? 'text-yellow' : ''}">${latestRSI.toFixed(2)}</span></div>
+                        <div class="stat-box"><span class="label">Target LONG</span><span class="value text-green">< ${dna.rsiThreshold}</span></div>
+                        <div class="stat-box"><span class="label">Target SHORT</span><span class="value text-red">> ${100 - dna.rsiThreshold}</span></div>
+                        <div class="stat-box"><span class="label">100 SMA</span><span class="value">$${latestSMA.toFixed(2)}</span></div>
+                        <div class="stat-box"><span class="label">1m ATR Volatility</span><span class="value">$${latestATR.toFixed(4)}</span></div>
+                        <div class="stat-box"><span class="label">1H Trend Context</span><span class="value ${htfTrendIndicator === 'Bullish' ? 'text-green' : 'text-red'}">${htfTrendIndicator}</span></div>
+                    </div>
+                </div>
                 
                 <div class="card">
                     <h3 style="margin: 0; font-size: 14px; color:var(--muted);">AI Brain & Strategy Overlays</h3>
@@ -494,7 +508,7 @@ app.get('/', async (req, res) => {
                     </div>
                     
                     <div class="ai-box" style="border-color: var(--green); background: rgba(16,185,129,0.05);">
-                        <strong>MTF Regime Confluence (15m/1H/4H):</strong><br/><em>"${aiMacroRegime}"</em>
+                        <strong>MTF Regime Confluence (1m/15m/1H/4H):</strong><br/><em>"${aiMacroRegime}"</em>
                     </div>
 
                     <div class="ai-box" style="border-color: var(--red); background: rgba(239, 68, 68, 0.05);">
