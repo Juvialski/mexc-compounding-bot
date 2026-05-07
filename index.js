@@ -9,11 +9,11 @@ const app = express();
 const port = process.env.PORT || 10000;
 
 // ==========================================
-// GEMINI AI SETUP
+// GEMINI AI SETUP (STABLE PRODUCTION ROUTE)
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const aiModel = genAI.getGenerativeModel({ 
-    model: "gemini-2.5-flash", 
+    model: "gemini-1.5-flash", // Official production endpoint
     generationConfig: {
         responseMimeType: "application/json",
     }
@@ -186,8 +186,6 @@ async function evolve() {
 
         const rsiV = RSI.calculate({ period: 14, values: closes });
         const atrV = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
-        
-        // Changed to 100 SMA for more realistic 1m pullback detection
         const smaV = SMA.calculate({ period: 100, values: closes });
         const sma60V = SMA.calculate({ period: 60, values: closes }); 
 
@@ -197,7 +195,6 @@ async function evolve() {
 
         const testSettings = (rsiT, atrM, rr) => {
             let score = 0; let tradesCount = 0;
-            // Start at 100 to account for the new 100 SMA
             for (let i = 100; i < closes.length - 15; i++) {
                 const price = closes[i]; 
                 const rsi = rsiV[i - offsetRSI];
@@ -209,7 +206,6 @@ async function evolve() {
                 const riskPct = riskDist / price; 
                 const rewardPct = (riskDist * rr) / price;
 
-                // LONG CONDITION
                 if (price > sma && rsi < rsiT) {
                     tradesCount++; 
                     const sl = price - riskDist; 
@@ -224,7 +220,6 @@ async function evolve() {
                         if (hitTP) { score += (rewardPct - feePercent); break; }
                     }
                 }
-                // SHORT CONDITION
                 if (price < sma && rsi > (100 - rsiT)) {
                     tradesCount++; 
                     const sl = price + riskDist; 
@@ -244,7 +239,6 @@ async function evolve() {
         };
 
         let results =[];
-        // Testing looser RSI parameters to actually trigger trades
         for (let r of [35, 40, 45, 50]) {
             for (let a of [1.5, 2.0, 2.5]) {
                 for (let rr of [1.5, 2.0, 2.5, 3.0]) {
@@ -348,7 +342,6 @@ async function tick() {
             const closes = ohlcv.map(c => c[4]);
             
             const rsi = RSI.calculate({ period: 14, values: closes }).pop();
-            // Match the live SMA calculation to the new 100 SMA used in evolution
             const sma = SMA.calculate({ period: 100, values: closes }).pop();
             const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); 
             const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
