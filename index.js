@@ -50,7 +50,7 @@ const formatPHT = (dateInput) => {
     });
 };
 
-// Helper: Send Webhook Alert (Discord/Slack/Etc)
+// Helper: Send Webhook Alert
 async function sendNotification(message) {
     const webhookUrl = process.env.WEBHOOK_URL; 
     if (!webhookUrl) return; 
@@ -76,7 +76,6 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
     equityAfter: Number, isWin: Boolean, time: { type: Date, default: Date.now }
 }));
 
-// DB Maintenance: Prevent free-tier MongoDB from filling up
 async function pruneDatabase() {
     try {
         const thirtyDaysAgo = new Date(Date.now() - (30 * 24 * 60 * 60 * 1000));
@@ -86,7 +85,7 @@ async function pruneDatabase() {
 }
 
 // ==========================================
-// EVOLUTION ENGINE (Bi-Directional Backtest)
+// EVOLUTION ENGINE 
 // ==========================================
 async function evolve() {
     try {
@@ -124,7 +123,6 @@ async function evolve() {
                         let hitSL = lows[i + j] <= sl;
                         let hitTP = highs[i + j] >= tp;
                         if (hitSL && hitTP) hitTP = false; 
-                        
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
                     }
@@ -136,7 +134,6 @@ async function evolve() {
                         let hitSL = highs[i + j] >= sl;
                         let hitTP = lows[i + j] <= tp;
                         if (hitSL && hitTP) hitTP = false; 
-                        
                         if (hitSL) { score -= (riskPct + feePercent); break; }
                         if (hitTP) { score += (rewardPct - feePercent); break; }
                     }
@@ -162,7 +159,7 @@ async function evolve() {
 }
 
 // ==========================================
-// TRADING TICKER (Bi-Directional)
+// TRADING TICKER 
 // ==========================================
 async function tick() {
     if (isTrading) return;
@@ -176,37 +173,52 @@ async function tick() {
 
         lastTicker = ticker;
         const price = Number(ticker.last || 0);
-        const rawPos = pos.find(p => p.symbol === SYMBOL && parseFloat(p.contracts) > 0);
+        
+        // Flexible parsing for CCXT changes in how they return size
+        const rawPos = pos.find(p => p.symbol === SYMBOL && (parseFloat(p.contracts) > 0 || parseFloat(p.amount) > 0 || parseFloat(p.info?.position) > 0));
 
         if (rawPos) {
-            // Position is Active
             const side = rawPos.side.toUpperCase();
-            const entryPrice = Number(rawPos.entryPrice || 0);
-            const contracts = Number(rawPos.contracts || 0);
+            const entryPrice = Number(rawPos.entryPrice || rawPos.price || rawPos.average || 0);
             
-            // Safer calculation to prevent NaN or Infinity values
-            const margin = (entryPrice * contracts * contractSize) / LEVERAGE;
+            // Resolve exact contracts quantity
+            let contracts = Number(rawPos.contracts || rawPos.amount || 0);
+            if (contracts === 0 && rawPos.info && rawPos.info.position) {
+                contracts = Number(rawPos.info.position);
+            }
+            
             const isLong = side === 'LONG';
-            const manualPnlUsd = (isLong ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
+            const pnlUsd = (isLong ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
 
-            // Prioritize Native Exchange ROE, fallback to manual math
-            const pnlUsd = rawPos.unrealizedPnl !== undefined ? Number(rawPos.unrealizedPnl) : manualPnlUsd;
-            const roe = rawPos.percentage !== undefined ? Number(rawPos.percentage) : (margin > 0 ? (pnlUsd / margin) * 100 : 0);
+            // Pure Math ROE (Does not require position size to calculate)
+            let roe = 0;
+            if (entryPrice > 0) {
+                const diff = isLong ? (price - entryPrice) : (entryPrice - price);
+                roe = (diff / entryPrice) * LEVERAGE * 100;
+            }
             
             activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe };
 
         } else if (activePosition && !rawPos) {
-            // Position was active last tick, but hit SL or TP
-            // Recalculate TRUE final PnL based on the exit market price
             const isLong = activePosition.side === 'LONG';
             const finalPnlUsd = (isLong ? (price - activePosition.entry) : (activePosition.entry - price)) * activePosition.size * contractSize;
-            const margin = (activePosition.entry * activePosition.size * contractSize) / LEVERAGE;
-            const finalRoe = margin > 0 ? (finalPnlUsd / margin) * 100 : 0;
+            
+            // Pure Math ROE
+            let finalRoe = 0;
+            if (activePosition.entry > 0) {
+                const diff = isLong ? (price - activePosition.entry) : (activePosition.entry - price);
+                finalRoe = (diff / activePosition.entry) * LEVERAGE * 100;
+            }
 
             await Trade.create({ 
-                side: activePosition.side, entry: activePosition.entry, exit: price, 
-                pnlUsd: finalPnlUsd, pnlPercent: finalRoe, 
-                equityAfter: walletBalance + finalPnlUsd, isWin: finalPnlUsd > 0 
+                side: activePosition.side, 
+                entry: activePosition.entry, 
+                exit: price, 
+                pnlUsd: finalPnlUsd, 
+                pnlPercent: finalRoe, 
+                equityAfter: walletBalance + finalPnlUsd, 
+                isWin: finalPnlUsd > 0,
+                time: new Date() // Fixes the exact trade closure timestamp!
             });
 
             await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nEntry: $${activePosition.entry.toFixed(2)}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
@@ -214,7 +226,6 @@ async function tick() {
             activePosition = null;
 
         } else if (Date.now() - lastOrderTime > 60000) {
-            // Scanning for New Entries
             activePosition = null;
             const closes = ohlcv.map(c => c[4]);
             const rsi = RSI.calculate({ period: 14, values: closes }).pop();
@@ -254,7 +265,7 @@ async function tick() {
 }
 
 // ==========================================
-// DASHBOARD UI (Philippine Time Optimized)
+// DASHBOARD UI
 // ==========================================
 app.get('/', async (req, res) => {
     if (dbStatus !== "Connected") {
@@ -268,7 +279,8 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        const allTrades = await Trade.find().sort({ time: -1 }).limit(10);
+        // USING .lean() IS CRITICAL. It strips Mongoose protections and returns pure JSON arrays!
+        const allTrades = await Trade.find().sort({ time: -1 }).limit(10).lean();
         const totalPnl = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
         const winCount = await Trade.countDocuments({ isWin: true });
         const totalCount = await Trade.countDocuments();
@@ -334,16 +346,19 @@ app.get('/', async (req, res) => {
                     <div style="overflow-x:auto;">
                         <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL USD</th></tr>
                         ${allTrades.map(t => {
-                            // UI FIX: Retroactively calculate PnL % for older DB entries that saved as 0
-                            let pnlPct = t.pnlPercent;
-                            if ((!pnlPct || pnlPct === 0) && t.entry && t.exit && t.entry > 0) {
+                            let pnlPct = Number(t.pnlPercent) || 0;
+                            
+                            // Pure Math Fallback (If old data has 0.00 saved in DB)
+                            if (pnlPct === 0 && t.entry && t.exit && t.entry > 0) {
                                 const diff = t.side === 'LONG' ? (t.exit - t.entry) : (t.entry - t.exit);
-                                pnlPct = (diff / t.entry) * 100 * LEVERAGE;
+                                pnlPct = (diff / t.entry) * LEVERAGE * 100;
                             }
-                            pnlPct = pnlPct || 0;
+
+                            // Ensures old trades don't display 'Current Time'
+                            const tradeTime = t.time ? new Date(t.time) : new Date();
 
                             return `<tr>
-                                <td>${formatPHT(t.time)}</td>
+                                <td>${formatPHT(tradeTime)}</td>
                                 <td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td>
                                 <td class="${pnlPct>=0?'text-green':'text-red'}">${pnlPct.toFixed(2)}%</td>
                                 <td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td>
