@@ -363,13 +363,17 @@ async function tick() {
                         const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                         const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                        const params = { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) };
+                        const params = { 
+                            'stopLoss': parseFloat(sl.toFixed(2)), 
+                            'takeProfit': parseFloat(tp.toFixed(2)),
+                            'postOnly': true 
+                        };
 
-                        await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, params);
+                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, params);
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence }; 
 
-                        await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nPrice: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 **AI Confidence:** ${aiConfidence}%\n💬 **Notes:** ${aiNotes}`);
+                        await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 **AI Confidence:** ${aiConfidence}%\n💬 **Notes:** ${aiNotes}`);
                     }
                 } else {
                     console.log(`🤖 AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
@@ -515,7 +519,7 @@ async function start() {
         
         await sendNotification(`System Started & AI Architecture Online.`);
         
-        setInterval(tick, 10000);           
+        setInterval(tick, 5000);           
         setInterval(analyzeMarketState, 1800000); // Every 30 mins
         setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // Every 1 hour      
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {} }, 30000);                          
