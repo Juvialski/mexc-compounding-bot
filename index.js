@@ -12,9 +12,9 @@ const port = process.env.PORT || 10000;
 // GEMINI AI SETUP
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// We force the AI to return ONLY valid JSON to prevent parsing crashes
+// Using the officially supported stable Flash model
 const aiModel = genAI.getGenerativeModel({ 
-    model: "gemini-1.5-flash",
+    model: "gemini-2.5-flash", 
     generationConfig: {
         responseMimeType: "application/json",
     }
@@ -147,9 +147,9 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of [25, 30, 35]) {
-            for (let a of[1.2, 1.5, 2.0]) {
-                for (let rr of[1.5, 1.8, 2.2]) {
+        for (let r of[25, 30, 35]) {
+            for (let a of[2.0]) {
+                for (let rr of[2.2]) {
                     results.push(testSettings(r, a, rr));
                 }
             }
@@ -186,7 +186,6 @@ async function evolve() {
             };
             console.log(`🧬 AI Evolved DNA. Selected Option ${aiDecision.selection}: ${aiDecision.reasoning}`);
         } catch (aiErr) {
-            // WE NOW LOG THE EXACT ERROR MESSAGE HERE
             console.error("AI Evolution Error, falling back to top score. DETAILS:", aiErr.message);
             dna = { ...top3[0], lastEvolved: formatPHT(new Date()), aiReasoning: "Fallback to highest backtest score (AI failed)." };
         }
@@ -268,7 +267,6 @@ async function tick() {
 
                     aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
                 } catch (e) { 
-                    // WE NOW LOG THE EXACT ERROR MESSAGE HERE
                     console.error("AI Pre-trade validation failed. DETAILS:", e.message); 
                 }
 
