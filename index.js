@@ -28,13 +28,25 @@ const mexc = new ccxt.mexc({
     enableRateLimit: true 
 });
 
-// Global Safety States
+// Global States
 let isTrading = false;
 let walletBalance = 0;
 let lastTicker = { last: 0 };
 let contractSize = 0.0001; 
 let lastOrderTime = 0; 
 let activePosition = null;
+
+// Helper: Format to Philippine Time (PHT)
+const formatPHT = (dateInput) => {
+    if (!dateInput) return 'N/A';
+    return new Date(dateInput).toLocaleString('en-US', { 
+        timeZone: 'Asia/Manila',
+        hour: '2-digit', 
+        minute: '2-digit', 
+        second: '2-digit',
+        hour12: true 
+    });
+};
 
 // ==========================================
 // DATABASE SCHEMA
@@ -46,7 +58,7 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 }));
 
 // ==========================================
-// EVOLUTION ENGINE
+// EVOLUTION ENGINE (Bi-Directional Backtest)
 // ==========================================
 async function evolve() {
     try {
@@ -69,6 +81,8 @@ async function evolve() {
                 const rsi = rsiV[i - offsetRSI];
                 const sma = smaV[i - offsetSMA];
                 const atr = atrV[i - offsetRSI];
+                
+                // Long Test
                 if (price > sma && rsi < rsiT) {
                     const sl = price - (atr * atrM);
                     const tp = price + (atr * atrM * rr);
@@ -77,6 +91,7 @@ async function evolve() {
                         if (highs[i + j] >= tp) { score += rr; break; }
                     }
                 }
+                // Short Test
                 if (price < sma && rsi > (100 - rsiT)) {
                     const sl = price + (atr * atrM);
                     const tp = price - (atr * atrM * rr);
@@ -96,7 +111,7 @@ async function evolve() {
                     const s = testSettings(r, a, rr);
                     if (s > bestScore) {
                         bestScore = s;
-                        dna = { rsiThreshold: r, atrMultiplier: a, rewardRatio: rr, lastEvolved: new Date().toLocaleString() };
+                        dna = { rsiThreshold: r, atrMultiplier: a, rewardRatio: rr, lastEvolved: formatPHT(new Date()) };
                     }
                 }
             }
@@ -105,7 +120,7 @@ async function evolve() {
 }
 
 // ==========================================
-// TRADING TICKER
+// TRADING TICKER (Bi-Directional)
 // ==========================================
 async function tick() {
     if (isTrading) return;
@@ -139,7 +154,9 @@ async function tick() {
             const sl = side === 'LONG' ? entryPrice - stopDist : entryPrice + stopDist;
             const tp = side === 'LONG' ? entryPrice + (stopDist * dna.rewardRatio) : entryPrice - (stopDist * dna.rewardRatio);
 
-            if ((side === 'LONG' && (price <= sl || price >= tp)) || (side === 'SHORT' && (price >= sl || price <= tp))) {
+            const exitHit = side === 'LONG' ? (price <= sl || price >= tp) : (price >= sl || price <= tp);
+
+            if (exitHit) {
                 await mexc.createOrder(SYMBOL, 'market', side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
                 await Trade.create({ 
                     side: side, entry: entryPrice, exit: price, 
@@ -148,29 +165,28 @@ async function tick() {
                 });
                 activePosition = null;
             }
-        } else {
+        } else if (Date.now() - lastOrderTime > 60000) {
             activePosition = null;
-            if (Date.now() - lastOrderTime > 60000) {
-                const closes = ohlcv.map(c => c[4]);
-                const rsi = RSI.calculate({ period: 14, values: closes }).pop();
-                const sma = SMA.calculate({ period: 200, values: closes }).pop();
-                const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
+            const closes = ohlcv.map(c => c[4]);
+            const rsi = RSI.calculate({ period: 14, values: closes }).pop();
+            const sma = SMA.calculate({ period: 200, values: closes }).pop();
+            const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
 
-                let action = null;
-                if (price > (sma || 0) && (rsi || 50) < dna.rsiThreshold) action = 'buy';
-                else if (price < (sma || 0) && (rsi || 50) > (100 - dna.rsiThreshold)) action = 'sell';
+            let action = null;
+            let orderSide = null;
+            if (price > (sma || 0) && (rsi || 50) < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
+            else if (price < (sma || 0) && (rsi || 50) > (100 - dna.rsiThreshold)) { action = 'SHORT'; orderSide = 'sell'; }
 
-                if (action) {
-                    const riskAmount = walletBalance * (RISK_PERCENT / 100);
-                    let qty = Math.floor(riskAmount / ((atr || 20) * dna.atrMultiplier * contractSize));
-                    const maxAfford = Math.floor((walletBalance * LEVERAGE * 0.8) / (price * contractSize));
-                    if (qty > maxAfford) qty = maxAfford;
+            if (action) {
+                const riskAmount = walletBalance * (RISK_PERCENT / 100);
+                let qty = Math.floor(riskAmount / ((atr || 20) * dna.atrMultiplier * contractSize));
+                const maxAfford = Math.floor((walletBalance * LEVERAGE * 0.8) / (price * contractSize));
+                if (qty > maxAfford) qty = maxAfford;
 
-                    if (qty >= 1) {
-                        const params = { 'openType': 1, 'positionType': action === 'buy' ? 1 : 2 };
-                        await mexc.createOrder(SYMBOL, 'market', action, qty, undefined, params);
-                        lastOrderTime = Date.now();
-                    }
+                if (qty >= 1) {
+                    const params = { 'openType': 1, 'positionType': action === 'LONG' ? 1 : 2 };
+                    await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, params);
+                    lastOrderTime = Date.now();
                 }
             }
         }
@@ -179,7 +195,7 @@ async function tick() {
 }
 
 // ==========================================
-// DASHBOARD UI (Error-Resistant)
+// DASHBOARD UI (Philippine Time Optimized)
 // ==========================================
 app.get('/', async (req, res) => {
     try {
@@ -189,13 +205,13 @@ app.get('/', async (req, res) => {
         const totalCount = await Trade.countDocuments();
         const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : 0;
 
-        let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center;">SCANNING BTC MARKET...</h2></div>`;
+        let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center;">SCANNING MARKET...</h2></div>`;
 
         if (activePosition) {
             activeCard = `
             <div class="card active-card pulse-border">
                 <div class="card-header">
-                    <h2><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE ${activePosition.side || '...'}</h2>
+                    <h2><span class="pulse-dot ${activePosition.side === 'LONG'?'dot-green':'dot-red'}"></span> ACTIVE ${activePosition.side}</h2>
                 </div>
                 <div class="grid grid-cols-4 gap-4 mt-4">
                     <div class="stat-box"><span class="label">Entry</span><span class="value">$${(activePosition.entry || 0).toFixed(1)}</span></div>
@@ -207,33 +223,33 @@ app.get('/', async (req, res) => {
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V10.3</title><meta http-equiv="refresh" content="5">
+            <!DOCTYPE html><html><head><title>Elite Sniper V10.4</title><meta http-equiv="refresh" content="5">
             <style>
                 :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; }
-                body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 20px; }
-                .container { max-width: 900px; margin: auto; }
-                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; }
-                .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
-                .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; }
-                .stat-value { font-size: 24px; font-weight: 800; margin-top: 5px; }
+                body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 20px; margin: 0; }
+                .container { max-width: 900px; margin: auto; padding: 10px; }
+                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+                .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 15px; margin-bottom: 15px; }
+                .stat-title { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+                .stat-value { font-size: 20px; font-weight: 800; margin-top: 5px; }
                 .active-card { border-color: var(--blue); background: #0f172a; }
-                .stat-box { background: rgba(0,0,0,0.2); padding: 10px; border-radius: 8px; text-align: center; }
-                .label { font-size: 10px; color: var(--muted); text-transform: uppercase; }
-                .value { font-size: 16px; font-weight: 600; display: block; }
+                .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
+                .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
+                .value { font-size: 14px; font-weight: 600; display: block; }
                 .text-green { color: var(--green); } .text-red { color: var(--red); }
-                .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+                .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
                 .badge-green { background: rgba(16,185,129,0.2); color: var(--green); }
                 .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
                 table { width: 100%; border-collapse: collapse; }
-                th { text-align: left; font-size: 12px; color: var(--muted); padding: 12px; border-bottom: 1px solid var(--border); }
-                td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+                th { text-align: left; font-size: 11px; color: var(--muted); padding: 10px; border-bottom: 1px solid var(--border); }
+                td { padding: 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
                 .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
                 .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h1 style="text-align:center; color:var(--blue);">🎯 SNIPER V10.3 (BTC)</h1>
+                <h2 style="text-align:center; color:var(--blue); margin-bottom:20px;">🎯 SNIPER V10.4 (PHT TIME)</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -242,17 +258,16 @@ app.get('/', async (req, res) => {
                 </div>
                 ${activeCard}
                 <div class="card">
-                    <h3 style="margin-top:0;">History</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 16px;">Trade History (PHT)</h3>
                     <table><tr><th>Time</th><th>Side</th><th>PnL %</th><th>PnL USD</th></tr>
-                    ${allTrades.map(t => `<tr><td>${t.time.toLocaleTimeString()}</td><td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td><td class="${(t.pnlPercent || 0)>=0?'text-green':'text-red'}">${(t.pnlPercent || 0).toFixed(2)}%</td><td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td></tr>`).join('')}
+                    ${allTrades.map(t => `<tr><td>${formatPHT(t.time)}</td><td><span class="badge ${t.side==='LONG'?'badge-green':'badge-red'}">${t.side}</span></td><td class="${(t.pnlPercent || 0)>=0?'text-green':'text-red'}">${(t.pnlPercent || 0).toFixed(2)}%</td><td class="${(t.pnlUsd || 0)>=0?'text-green':'text-red'}">$${(t.pnlUsd || 0).toFixed(2)}</td></tr>`).join('')}
                     </table>
                 </div>
-                <div style="text-align:center; font-size:11px; color:var(--muted);">
-                    DNA: RSI Target ${dna.rsiThreshold} | ATR Multiplier ${dna.atrMultiplier} | RR ${dna.rewardRatio}<br>
-                    Last Evolved: ${dna.lastEvolved}
+                <div style="text-align:center; font-size:10px; color:var(--muted);">
+                    DNA Evolved at: ${dna.lastEvolved} | System Time: ${formatPHT(new Date())}
                 </div>
             </div></body></html>`);
-    } catch (e) { res.send(`UI Error: Please wait for bot to fetch data... (${e.message})`); }
+    } catch (e) { res.send(`UI Error: Syncing Data... (${e.message})`); }
 });
 
 // ==========================================
@@ -270,7 +285,7 @@ async function start() {
         setInterval(evolve, 3600000);      
         setInterval(async () => {          
             try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {}
-        }, 20000);
+        }, 15000);
     } catch (e) { console.error(e); setTimeout(start, 10000); }
 }
 
