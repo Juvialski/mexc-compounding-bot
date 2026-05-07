@@ -75,6 +75,12 @@ let contractSize = 0.0001;
 let lastOrderTime = 0; 
 let activePosition = null;
 
+// NEW LIVE TECHNICAL STATES FOR DASHBOARD
+let latestRSI = 50;
+let latestSMA = 0;
+let latestATR = 0;
+let htfTrendIndicator = "Awaiting tick...";
+
 // NEW AI MEMORY STATES
 let aiMacroRegime = "Awaiting initial analysis...";
 let aiRecentLessons = ["No recent trades to analyze."];
@@ -96,7 +102,7 @@ async function sendNotification(message) {
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: `🎯 **Sniper V11.4 (AI Edition)**\n${message}` })
+            body: JSON.stringify({ content: `🎯 Sniper V11.4 (AI Edition)\n${message}` })
         });
     } catch (e) { console.error("Notification Error:", e.message); }
 }
@@ -332,7 +338,7 @@ async function tick() {
             };
 
             await Trade.create(tradeToSave);
-            await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
+            await sendNotification(`Position Closed 🏁\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             
             postTradeReflection(tradeToSave);
             activePosition = null;
@@ -345,6 +351,18 @@ async function tick() {
             const sma = SMA.calculate({ period: 100, values: closes }).pop();
             const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); 
             const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
+
+            // --- UPDATE LIVE VARIABLES FOR DASHBOARD ---
+            latestRSI = rsi || 50;
+            latestSMA = sma || 0;
+            latestATR = atr || 0;
+            htfTrendIndicator = price > (sma60 || 0) ? "Bullish" : "Bearish";
+            // -------------------------------------------
+
+            const currentRsi = rsi || 50;
+            if (currentRsi < dna.rsiThreshold + 10 || currentRsi > (100 - dna.rsiThreshold) - 10) {
+                console.log(`[WATCHING] Price: $${price} | 1m SMA100: $${(sma || 0).toFixed(2)} | 1m RSI: ${currentRsi.toFixed(2)} | Target: <${dna.rsiThreshold} or >${100 - dna.rsiThreshold}`);
+            }
 
             let action = null; let orderSide = null;
             if (price > (sma || 0) && (rsi || 50) < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
@@ -394,7 +412,7 @@ async function tick() {
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence }; 
 
-                        await sendNotification(`**New Position Opened** 🚀\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 **AI Confidence:** ${aiConfidence}%\n💬 **Notes:** ${aiNotes}`);
+                        await sendNotification(`New Position Opened 🚀\nSide: ${action}\nLimit Price: $${price.toFixed(2)}\nSize: ${qty}\nLeverage: ${LEVERAGE}x\n🧠 AI Confidence: ${aiConfidence}%\n💬 Notes: ${aiNotes}`);
                     }
                 } else {
                     console.log(`🤖 AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
@@ -456,7 +474,7 @@ app.get('/', async (req, res) => {
                 .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
                 .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
                 .value { font-size: 14px; font-weight: 600; display: block; }
-                .text-green { color: var(--green); } .text-red { color: var(--red); }
+                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); }
                 .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
                 .badge-green { background: rgba(16,185,129,0.2); color: var(--green); }
                 .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
@@ -499,6 +517,18 @@ app.get('/', async (req, res) => {
                         <ul style="margin: 5px 0; padding-left: 20px;">
                             ${aiRecentLessons.map(lesson => `<li><em>${lesson}</em></li>`).join('')}
                         </ul>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">📡 Live Technical Radar</h3>
+                    <div class="grid" style="grid-template-columns: repeat(3, 1fr);">
+                        <div class="stat-box"><span class="label">1m RSI</span><span class="value ${latestRSI < dna.rsiThreshold + 5 || latestRSI > (100 - dna.rsiThreshold) - 5 ? 'text-yellow' : ''}">${latestRSI.toFixed(2)}</span></div>
+                        <div class="stat-box"><span class="label">Target LONG</span><span class="value text-green">< ${dna.rsiThreshold}</span></div>
+                        <div class="stat-box"><span class="label">Target SHORT</span><span class="value text-red">> ${100 - dna.rsiThreshold}</span></div>
+                        <div class="stat-box"><span class="label">100 SMA</span><span class="value">$${latestSMA.toFixed(2)}</span></div>
+                        <div class="stat-box"><span class="label">1m ATR Volatility</span><span class="value">$${latestATR.toFixed(4)}</span></div>
+                        <div class="stat-box"><span class="label">1H Trend Context</span><span class="value ${htfTrendIndicator === 'Bullish' ? 'text-green' : 'text-red'}">${htfTrendIndicator}</span></div>
                     </div>
                 </div>
 
