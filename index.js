@@ -12,7 +12,13 @@ const port = process.env.PORT || 10000;
 // GEMINI AI SETUP
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const aiModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+// We force the AI to return ONLY valid JSON to prevent parsing crashes
+const aiModel = genAI.getGenerativeModel({ 
+    model: "gemini-1.5-flash",
+    generationConfig: {
+        responseMimeType: "application/json",
+    }
+});
 
 // ==========================================
 // EVOLVING PARAMETERS & STATE
@@ -140,10 +146,10 @@ async function evolve() {
             return { score, tradesCount, rsiThreshold: rsiT, atrMultiplier: atrM, rewardRatio: rr };
         };
 
-        let results = [];
+        let results =[];
         for (let r of [25, 30, 35]) {
-            for (let a of [1.2, 1.5, 2.0]) {
-                for (let rr of [1.5, 1.8, 2.2]) {
+            for (let a of[1.2, 1.5, 2.0]) {
+                for (let rr of[1.5, 1.8, 2.2]) {
                     results.push(testSettings(r, a, rr));
                 }
             }
@@ -166,10 +172,10 @@ async function evolve() {
             2. RSI: ${top3[1].rsiThreshold}, ATRx: ${top3[1].atrMultiplier}, RR: ${top3[1].rewardRatio}, Score: ${top3[1].score.toFixed(4)}, Trades: ${top3[1].tradesCount}
             3. RSI: ${top3[2].rsiThreshold}, ATRx: ${top3[2].atrMultiplier}, RR: ${top3[2].rewardRatio}, Score: ${top3[2].score.toFixed(4)}, Trades: ${top3[2].tradesCount}
             Select the best set (1, 2, or 3) that provides a balance of profitability and safety (avoiding curve-fitting).
-            Respond ONLY in valid JSON: {"selection": 1, "reasoning": "your short explanation"}`;
+            Use this exact JSON schema for your response: {"selection": 1, "reasoning": "your short explanation"}`;
 
             const result = await aiModel.generateContent(prompt);
-            const responseText = result.response.text().replace(/```json|```/g, '').trim();
+            const responseText = result.response.text().trim();
             const aiDecision = JSON.parse(responseText);
             const selected = top3[(aiDecision.selection - 1) || 0]; 
             
@@ -180,7 +186,8 @@ async function evolve() {
             };
             console.log(`🧬 AI Evolved DNA. Selected Option ${aiDecision.selection}: ${aiDecision.reasoning}`);
         } catch (aiErr) {
-            console.error("AI Evolution Error, falling back to top score.");
+            // WE NOW LOG THE EXACT ERROR MESSAGE HERE
+            console.error("AI Evolution Error, falling back to top score. DETAILS:", aiErr.message);
             dna = { ...top3[0], lastEvolved: formatPHT(new Date()), aiReasoning: "Fallback to highest backtest score (AI failed)." };
         }
     } catch (e) { console.error("Evolution Error:", e.message); }
@@ -253,14 +260,17 @@ async function tick() {
                     You are a risk management AI for a crypto sniper bot. A technical signal fired for ${SYMBOL}.
                     Action: ${action} | Current Price: $${price} | SMA 200: $${sma.toFixed(2)} | 1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
                     Based strictly on price action and mean-reversion logic, validate this trade. 
-                    Reply strictly in JSON: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
+                    Use this exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                     
                     const result = await aiModel.generateContent(prompt);
-                    const responseText = result.response.text().replace(/```json|```/g, '').trim();
+                    const responseText = result.response.text().trim();
                     const aiDecision = JSON.parse(responseText);
 
                     aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
-                } catch (e) { console.error("AI Pre-trade validation failed."); }
+                } catch (e) { 
+                    // WE NOW LOG THE EXACT ERROR MESSAGE HERE
+                    console.error("AI Pre-trade validation failed. DETAILS:", e.message); 
+                }
 
                 if (aiApproved && aiConfidence >= 50) {
                     const riskAmount = walletBalance * (RISK_PERCENT / 100);
