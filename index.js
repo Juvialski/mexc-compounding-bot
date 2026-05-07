@@ -20,6 +20,29 @@ const aiModel = genAI.getGenerativeModel({
 });
 
 // ==========================================
+// AI RETRY WRAPPER (EXPONENTIAL BACKOFF)
+// ==========================================
+async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const result = await aiModel.generateContent(prompt);
+            const responseText = result.response.text().trim();
+            return JSON.parse(responseText);
+        } catch (error) {
+            const is503 = error.message && error.message.includes('503');
+            
+            if (is503 && attempt < maxRetries) {
+                const delay = baseDelayMs * attempt; 
+                console.warn(`⚠️ Gemini API 503 Error. Retrying attempt ${attempt + 1} in ${delay / 1000} seconds...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            } else {
+                throw error; 
+            }
+        }
+    }
+}
+
+// ==========================================
 // EVOLVING PARAMETERS & STATE
 // ==========================================
 let dna = {
@@ -104,7 +127,6 @@ async function pruneDatabase() {
 // ==========================================
 async function analyzeMarketState() {
     try {
-        // Fetch 15-minute candles for Macro view
         const ohlcv15m = await mexc.fetchOHLCV(SYMBOL, '15m', undefined, 100);
         const closes = ohlcv15m.map(c => c[4]);
         
@@ -119,9 +141,7 @@ async function analyzeMarketState() {
         Determine the overarching market regime (e.g., Choppy, Trending Bullish, Overextended Bearish).
         Use this exact JSON schema: {"regime": "1-3 word description", "advice": "One sentence tip for 1-minute scalping right now."}`;
 
-        const result = await aiModel.generateContent(prompt);
-        const responseText = result.response.text().trim();
-        const aiDecision = JSON.parse(responseText);
+        const aiDecision = await askAIWithRetry(prompt);
 
         aiMacroRegime = `${aiDecision.regime} - ${aiDecision.advice}`;
         console.log(`🌐 Macro State Updated: ${aiMacroRegime}`);
@@ -142,11 +162,8 @@ async function postTradeReflection(tradeData) {
         Provide a 1-sentence lesson learned from this trade to improve future entries or risk management.
         Use this exact JSON schema: {"lesson": "your 1 sentence lesson"}`;
 
-        const result = await aiModel.generateContent(prompt);
-        const responseText = result.response.text().trim();
-        const aiDecision = JSON.parse(responseText);
+        const aiDecision = await askAIWithRetry(prompt);
 
-        // Add to memory, keep only the last 3 lessons to save tokens
         if (aiRecentLessons[0] === "No recent trades to analyze.") aiRecentLessons.shift();
         aiRecentLessons.push(`[${tradeData.pnlPercent > 0 ? 'WIN' : 'LOSS'}] ${aiDecision.lesson}`);
         if (aiRecentLessons.length > 3) aiRecentLessons.shift();
@@ -254,9 +271,7 @@ async function evolve() {
             Select the best set (1, 2, or 3) to avoid curve-fitting.
             Use exact JSON schema: {"selection": 1, "reasoning": "short explanation"}`;
 
-            const result = await aiModel.generateContent(prompt);
-            const responseText = result.response.text().trim();
-            const aiDecision = JSON.parse(responseText);
+            const aiDecision = await askAIWithRetry(prompt);
             const selected = top3[(aiDecision.selection - 1) || 0]; 
             
             dna = { 
@@ -321,9 +336,7 @@ async function tick() {
             await Trade.create(tradeToSave);
             await sendNotification(`**Position Closed** 🏁\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${finalPnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             
-            // Trigger Post-Trade AI Reflection (Does not block tick)
             postTradeReflection(tradeToSave);
-            
             activePosition = null;
 
         } else if (Date.now() - lastOrderTime > 60000) {
@@ -355,9 +368,7 @@ async function tick() {
                     Based on technicals, macro regime, and past lessons, validate this trade. 
                     Use exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                     
-                    const result = await aiModel.generateContent(prompt);
-                    const responseText = result.response.text().trim();
-                    const aiDecision = JSON.parse(responseText);
+                    const aiDecision = await askAIWithRetry(prompt, 2, 3000); 
 
                     aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
                 } catch (e) { 
@@ -389,7 +400,7 @@ async function tick() {
                     }
                 } else {
                     console.log(`🤖 AI Rejected Trade: ${action} - Confidence: ${aiConfidence}%. Reason: ${aiNotes}`);
-                    lastOrderTime = Date.now() - 30000; // brief cooldown
+                    lastOrderTime = Date.now() - 30000; 
                 }
             }
         }
@@ -525,15 +536,14 @@ async function start() {
         const b = await mexc.fetchBalance();
         walletBalance = b.total['USDT'] || 0;
         
-        // Stagger startup calls to respect burst rate limits
         await analyzeMarketState(); 
         setTimeout(async () => { await evolve(); }, 3000); 
         
         await sendNotification(`System Started & AI Architecture Online.`);
         
         setInterval(tick, 5000);           
-        setInterval(analyzeMarketState, 1800000); // Every 30 mins
-        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // Every 1 hour      
+        setInterval(analyzeMarketState, 1800000); 
+        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000);     
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e) {} }, 30000);                          
         
     } catch (e) { console.error(e); setTimeout(start, 10000); }
