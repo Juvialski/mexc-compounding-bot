@@ -46,7 +46,7 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
 // EVOLVING PARAMETERS & STATE
 // ==========================================
 let dna = {
-    rsiThreshold: 30,
+    rsiThreshold: 40,
     atrMultiplier: 2.0,
     rewardRatio: 2.2,
     lastEvolved: 'Initialising...',
@@ -186,7 +186,9 @@ async function evolve() {
 
         const rsiV = RSI.calculate({ period: 14, values: closes });
         const atrV = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
-        const smaV = SMA.calculate({ period: 200, values: closes });
+        
+        // Changed to 100 SMA for more realistic 1m pullback detection
+        const smaV = SMA.calculate({ period: 100, values: closes });
         const sma60V = SMA.calculate({ period: 60, values: closes }); 
 
         const offsetRSI = closes.length - rsiV.length;
@@ -195,7 +197,8 @@ async function evolve() {
 
         const testSettings = (rsiT, atrM, rr) => {
             let score = 0; let tradesCount = 0;
-            for (let i = 200; i < closes.length - 15; i++) {
+            // Start at 100 to account for the new 100 SMA
+            for (let i = 100; i < closes.length - 15; i++) {
                 const price = closes[i]; 
                 const rsi = rsiV[i - offsetRSI];
                 const sma = smaV[i - offsetSMA]; 
@@ -241,7 +244,8 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of [25, 30, 35, 40]) {
+        // Testing looser RSI parameters to actually trigger trades
+        for (let r of [35, 40, 45, 50]) {
             for (let a of [1.5, 2.0, 2.5]) {
                 for (let rr of [1.5, 2.0, 2.5, 3.0]) {
                     results.push(testSettings(r, a, rr));
@@ -344,7 +348,8 @@ async function tick() {
             const closes = ohlcv.map(c => c[4]);
             
             const rsi = RSI.calculate({ period: 14, values: closes }).pop();
-            const sma = SMA.calculate({ period: 200, values: closes }).pop();
+            // Match the live SMA calculation to the new 100 SMA used in evolution
+            const sma = SMA.calculate({ period: 100, values: closes }).pop();
             const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); 
             const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
 
@@ -359,7 +364,7 @@ async function tick() {
                 try {
                     const prompt = `
                     You are the ultimate crypto risk manager. A ${action} signal fired for 1m ${SYMBOL}.
-                    Price: $${price} | 1m SMA(200): $${sma.toFixed(2)} | 1H Trend: ${htfTrend}
+                    Price: $${price} | 1m SMA(100): $${sma.toFixed(2)} | 1H Trend: ${htfTrend}
                     1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
                     
                     MACRO REGIME CONTEXT: ${aiMacroRegime}
