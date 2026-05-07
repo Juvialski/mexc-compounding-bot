@@ -12,7 +12,6 @@ const port = process.env.PORT || 10000;
 // GEMINI AI SETUP
 // ==========================================
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Using the officially supported stable Flash model
 const aiModel = genAI.getGenerativeModel({ 
     model: "gemini-2.5-flash", 
     generationConfig: {
@@ -25,8 +24,8 @@ const aiModel = genAI.getGenerativeModel({
 // ==========================================
 let dna = {
     rsiThreshold: 30,
-    atrMultiplier: 1.5,
-    rewardRatio: 1.5,
+    atrMultiplier: 2.0,
+    rewardRatio: 2.2,
     lastEvolved: 'Initialising...',
     aiReasoning: 'Waiting for first evolution...'
 };
@@ -70,7 +69,7 @@ async function sendNotification(message) {
         await fetch(webhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content: `🎯 **Sniper V11.2 (AI Edition)**\n${message}` })
+            body: JSON.stringify({ content: `🎯 **Sniper V11.3 (AI Edition)**\n${message}` })
         });
     } catch (e) { console.error("Notification Error:", e.message); }
 }
@@ -109,6 +108,7 @@ async function evolve() {
         const rsiV = RSI.calculate({ period: 14, values: closes });
         const atrV = ATR.calculate({ period: 14, high: highs, low: lows, close: closes });
         const smaV = SMA.calculate({ period: 200, values: closes });
+        const sma60V = SMA.calculate({ period: 60, values: closes }); // 1H Trend Context
 
         const offsetRSI = closes.length - rsiV.length;
         const offsetSMA = closes.length - smaV.length;
@@ -117,12 +117,15 @@ async function evolve() {
         const testSettings = (rsiT, atrM, rr) => {
             let score = 0; let tradesCount = 0;
             for (let i = 200; i < closes.length - 15; i++) {
-                const price = closes[i]; const rsi = rsiV[i - offsetRSI];
-                const sma = smaV[i - offsetSMA]; const atr = atrV[i - offsetRSI];
+                const price = closes[i]; 
+                const rsi = rsiV[i - offsetRSI];
+                const sma = smaV[i - offsetSMA]; 
+                const atr = atrV[i - offsetRSI];
                 const riskDist = atr * atrM;
                 if (riskDist === 0) continue;
                 
-                const riskPct = riskDist / price; const rewardPct = (riskDist * rr) / price;
+                const riskPct = riskDist / price; 
+                const rewardPct = (riskDist * rr) / price;
 
                 if (price > sma && rsi < rsiT) {
                     tradesCount++; const sl = price - riskDist; const tp = price + (riskDist * rr);
@@ -147,9 +150,10 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of[25, 30, 35]) {
-            for (let a of[2.0]) {
-                for (let rr of[2.2]) {
+        // Expanded array to allow true AI DNA mutation
+        for (let r of [25, 30, 35, 40]) {
+            for (let a of [1.5, 2.0, 2.5]) {
+                for (let rr of [1.5, 2.0, 2.5, 3.0]) {
                     results.push(testSettings(r, a, rr));
                 }
             }
@@ -160,13 +164,16 @@ async function evolve() {
         
         const currentPrice = closes[closes.length - 1];
         const currentSMA = smaV[smaV.length - 1];
+        const currentSMA60 = sma60V[sma60V.length - 1];
         const currentATR = atrV[atrV.length - 1];
+        
         const trend = currentPrice > currentSMA ? "Bullish" : "Bearish";
+        const htfTrend = currentPrice > currentSMA60 ? "Bullish" : "Bearish";
 
         try {
             const prompt = `
             You are a crypto quantitative analyst. We backtested parameters on 1m BTC data. 
-            Current Context: Trend is ${trend}, Price: $${currentPrice}, Volatility (ATR): $${currentATR.toFixed(2)}.
+            Current Context: 1m Trend is ${trend}, 1H Trend is ${htfTrend}, Price: $${currentPrice}, Volatility (ATR): $${currentATR.toFixed(2)}.
             Here are the top 3 parameter sets based on net score:
             1. RSI: ${top3[0].rsiThreshold}, ATRx: ${top3[0].atrMultiplier}, RR: ${top3[0].rewardRatio}, Score: ${top3[0].score.toFixed(4)}, Trades: ${top3[0].tradesCount}
             2. RSI: ${top3[1].rsiThreshold}, ATRx: ${top3[1].atrMultiplier}, RR: ${top3[1].rewardRatio}, Score: ${top3[1].score.toFixed(4)}, Trades: ${top3[1].tradesCount}
@@ -199,10 +206,10 @@ async function tick() {
     if (isTrading) return;
     isTrading = true;
     try {
-        const[ticker, pos, ohlcv] = await Promise.all([
+        const [ticker, pos, ohlcv] = await Promise.all([
             mexc.fetchTicker(SYMBOL),
             mexc.fetchPositions([SYMBOL]),
-            mexc.fetchOHLCV(SYMBOL, TIMEFRAME, undefined, 210)
+            mexc.fetchOHLCV(SYMBOL, TIMEFRAME, undefined, 250)
         ]);
 
         lastTicker = ticker;
@@ -244,8 +251,10 @@ async function tick() {
         } else if (Date.now() - lastOrderTime > 60000) {
             activePosition = null;
             const closes = ohlcv.map(c => c[4]);
+            
             const rsi = RSI.calculate({ period: 14, values: closes }).pop();
             const sma = SMA.calculate({ period: 200, values: closes }).pop();
+            const sma60 = SMA.calculate({ period: 60, values: closes }).pop(); // 1H HTF Context
             const atr = ATR.calculate({ period: 14, high: ohlcv.map(c=>c[2]), low: ohlcv.map(c=>c[3]), close: closes }).pop();
 
             let action = null; let orderSide = null;
@@ -254,11 +263,15 @@ async function tick() {
 
             if (action) {
                 let aiConfidence = 100; let aiApproved = true; let aiNotes = "Technical Signal Triggered.";
+                const htfTrend = price > sma60 ? "Bullish" : "Bearish";
+
                 try {
                     const prompt = `
                     You are a risk management AI for a crypto sniper bot. A technical signal fired for ${SYMBOL}.
-                    Action: ${action} | Current Price: $${price} | SMA 200: $${sma.toFixed(2)} | 1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
-                    Based strictly on price action and mean-reversion logic, validate this trade. 
+                    Action: ${action} | Current Price: $${price} 
+                    1m SMA(200): $${sma.toFixed(2)} | 1H SMA(60-min): $${sma60.toFixed(2)} (HTF Trend is ${htfTrend})
+                    1m RSI: ${rsi.toFixed(2)} | 1m ATR: $${atr.toFixed(2)}
+                    Based strictly on price action, mean-reversion logic, and the higher timeframe trend context, validate this trade. 
                     Use this exact JSON schema: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                     
                     const result = await aiModel.generateContent(prompt);
@@ -307,7 +320,6 @@ app.get('/reset-db', async (req, res) => {
     catch (e) { res.send(`Error: ${e.message}`); }
 });
 
-// Basic Keep-Alive Route for Cron-Job
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
@@ -335,7 +347,7 @@ app.get('/', async (req, res) => {
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Elite Sniper V11.2 AI</title>
+            <!DOCTYPE html><html><head><title>Elite Sniper V11.3 AI</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <meta http-equiv="refresh" content="5">
             <style>
@@ -360,11 +372,11 @@ app.get('/', async (req, res) => {
                 .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; }
                 .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
-                .ai-reasoning { background: rgba(168, 85, 247, 0.1); padding: 10px; border-left: 3px solid var(--blue); border-radius: 4px; font-size: 12px; margin-top: 10px; }
+                .ai-reasoning { background: rgba(168, 85, 247, 0.1); padding: 10px; border-left: 3px solid var(--blue); border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.5; }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🧠 SNIPER V11.2 AI EDITION</h2>
+                <h2 style="text-align:center; color:var(--blue); margin-top:5px; margin-bottom:20px;">🧠 SNIPER V11.3 AI EDITION</h2>
                 <div class="grid">
                     <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
                     <div class="card"><div class="stat-title">BTC Price</div><div class="stat-value">$${Number(lastTicker.last || 0).toFixed(1)}</div></div>
@@ -376,8 +388,8 @@ app.get('/', async (req, res) => {
                     <h3 style="margin: 0; font-size: 14px; color:var(--muted);">Current AI DNA Status</h3>
                     <div class="ai-reasoning">
                         <strong>Last Evolved:</strong> ${dna.lastEvolved}<br/>
-                        <strong>Selected Params:</strong> RSI: ${dna.rsiThreshold} | ATRx: ${dna.atrMultiplier} | RR: ${dna.rewardRatio}<br/>
-                        <strong>AI Rationale:</strong> "${dna.aiReasoning}"
+                        <strong>Selected Params:</strong> RSI Threshold: ${dna.rsiThreshold} | ATR Multiplier: ${dna.atrMultiplier}x | Reward Ratio: ${dna.rewardRatio}x<br/>
+                        <strong style="color:var(--text);">AI Rationale:</strong> "${dna.aiReasoning}"
                     </div>
                 </div>
                 <div class="card">
