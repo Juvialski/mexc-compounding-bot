@@ -1,5 +1,5 @@
 // ==========================================
-// Paste May 08, 2026 - UPGRADED AI EDITION (WITH BUG FIXES & ENHANCED UI)
+// Paste May 08, 2026 - UPGRADED AI EDITION (WITH PROPER DASHBOARD SIZING FIX)
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -405,14 +405,12 @@ async function tick() {
                         const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                         const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                        // FIX: Removed postOnly to prevent silent rejections of valid trades
                         await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence, slMovedToBreakeven: false }; 
 
                         await sendNotification(`New Position Opened\nSide: ${action}\nLimit: $${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
                     } else {
-                        // FIX: Added logging if account balance is too low to trade
                         console.log(`[WARNING] AI approved trade, but calculated QTY (${qty}) is less than 1 contract. Check Wallet Balance ($${walletBalance.toFixed(2)}).`);
                         lastOrderTime = Date.now() - 30000;
                     }
@@ -445,7 +443,17 @@ app.get('/', async (req, res) => {
         
         // Calculate projected trade size to inform the user
         const estimatedRisk = walletBalance * (currentRiskPercent / 100);
-        let projectedQty = latestATR > 0 ? Math.floor(estimatedRisk / (latestATR * dna.atrMultiplier * contractSize)) : 0;
+        let idealQty = latestATR > 0 ? Math.floor(estimatedRisk / (latestATR * dna.atrMultiplier * contractSize)) : 0;
+        
+        // Apply the same margin cap the actual bot uses internally
+        const maxAfford = currentPrice > 0 ? Math.floor((walletBalance * LEVERAGE * 0.8) / (currentPrice * contractSize)) : 0;
+        
+        let finalProjectedQty = idealQty;
+        let marginWarning = '';
+        if (idealQty > maxAfford) {
+            finalProjectedQty = maxAfford;
+            marginWarning = `<div style="font-size: 9px; color: var(--yellow); margin-top: 2px;">⚠️ Capped by Margin</div>`;
+        }
 
         let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center; margin:0; font-size:16px;">SCANNING MARKET (PRICE: $${currentPrice.toFixed(2)})</h2></div>`;
         if (activePosition && activePosition.side) {
@@ -514,9 +522,13 @@ app.get('/', async (req, res) => {
                         <div class="stat-box"><span class="label">Target SHORT</span><span class="value text-red">> ${100 - dna.rsiThreshold}</span></div>
                         <div class="stat-box"><span class="label">100 SMA</span><span class="value">$${latestSMA.toFixed(2)}</span></div>
                         <div class="stat-box"><span class="label">1H Trend Context</span><span class="value ${htfTrendIndicator === 'Bullish' ? 'text-green' : 'text-red'}">${htfTrendIndicator}</span></div>
-                        <div class="stat-box"><span class="label">Projected Trade Size</span><span class="value ${projectedQty < 1 ? 'text-red' : 'text-purple'}">${projectedQty} Contracts</span></div>
+                        <div class="stat-box">
+                            <span class="label">Projected Size</span>
+                            <span class="value ${finalProjectedQty < 1 ? 'text-red' : 'text-purple'}">${finalProjectedQty} CTs</span>
+                            ${marginWarning}
+                        </div>
                     </div>
-                    ${projectedQty < 1 ? '<div style="margin-top:10px; font-size:11px; color:var(--red); text-align:center;">⚠️ Projected Trade Size is 0. Increase wallet balance or AI Risk % to trade.</div>' : ''}
+                    ${finalProjectedQty < 1 ? '<div style="margin-top:10px; font-size:11px; color:var(--red); text-align:center;">⚠️ Projected Trade Size is 0. Increase wallet balance or AI Risk % to trade.</div>' : ''}
                 </div>
                 
                 <div class="card">
