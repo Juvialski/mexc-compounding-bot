@@ -1,5 +1,5 @@
 // ==========================================
-// Paste May 08, 2026 - UPGRADED AI EDITION (WITH PROPER DASHBOARD SIZING FIX)
+// Paste May 08, 2026 - ZERO SLIPPAGE + AI ABORT EDITION
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -252,7 +252,7 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of [35, 40, 45, 50]) for (let a of[1.5, 2.0, 2.5]) for (let rr of[1.5, 2.0, 2.5, 3.0]) results.push(testSettings(r, a, rr));
+        for (let r of[35, 40, 45, 50]) for (let a of[1.5, 2.0, 2.5]) for (let rr of[1.5, 2.0, 2.5, 3.0]) results.push(testSettings(r, a, rr));
         results.sort((a, b) => b.score - a.score);
         
         const top = results[0];
@@ -360,17 +360,15 @@ async function tick() {
             }
 
         } else if (activePosition && !rawPos) {
-            // --- BUG FIX START: Handle pending Limit/Market Orders ---
+            // Wait for DB/MEXC to sync if entry is undefined
             if (activePosition.entry === undefined || activePosition.pnlUsd === undefined) {
-                // If order has been pending for more than 3 minutes, cancel it so the bot doesn't get stuck
                 if (Date.now() - lastOrderTime > 180000) { 
                     console.log("Order took too long to register. Canceling/Resetting...");
                     await mexc.cancelAllOrders(SYMBOL).catch(e=>console.log(e));
                     activePosition = null; 
                 }
-                return; // Exit this tick and wait for the order to fill
+                return;
             }
-            // --- BUG FIX END ---
 
             const finalRoe = (activePosition.entry > 0) ? (((activePosition.side === 'LONG' ? (price - activePosition.entry) : (activePosition.entry - price)) / activePosition.entry) * LEVERAGE * 100) : 0;
             const tradeToSave = { 
@@ -379,12 +377,8 @@ async function tick() {
                 isWin: activePosition.pnlUsd > 0, time: new Date(), aiConfidence: activePosition.aiConfidence 
             };
             
-            // Added Try/Catch so DB errors never crash the main bot loop again
-            try {
-                await Trade.create(tradeToSave);
-            } catch (dbErr) {
-                console.error("DB Save Error, ignoring to keep bot alive:", dbErr.message);
-            }
+            try { await Trade.create(tradeToSave); } 
+            catch (dbErr) { console.error("DB Save Error, ignoring to keep bot alive:", dbErr.message); }
 
             await sendNotification(`Position Closed\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${activePosition.pnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             postTradeReflection(tradeToSave);
@@ -398,46 +392,70 @@ async function tick() {
             else if (price < sma100 && rsi > (100 - dna.rsiThreshold)) { action = 'SHORT'; orderSide = 'sell'; }
 
             if (action) {
-                let aiApproved = true; let aiConfidence = 80; let aiNotes = "Technical Signal Triggered.";
-                try {
-                    const prompt = `
-                    Signal: ${action} on ${SYMBOL}. Price: $${price} | RSI: ${rsi.toFixed(2)} | SMA: $${sma100.toFixed(2)}.
-                    EOD Strategy Shift: ${eodStrategyShift}
-                    MTF Macro Context: ${aiMacroRegime}
-                    Recent Lessons: ${aiRecentLessons.join(" | ")}
-                    
-                    Should we take this trade? Ensure it aligns with higher timeframes and lessons.
-                    Use JSON: {"approved": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
-                    
-                    const aiDecision = await askAIWithRetry(prompt, 2, 3000); 
-                    aiApproved = aiDecision.approved; aiConfidence = aiDecision.confidence_score_1_to_100; aiNotes = aiDecision.reason;
-                } catch (e) { }
+                const riskAmount = walletBalance * (currentRiskPercent / 100);
+                let qty = Math.floor(riskAmount / (atr * dna.atrMultiplier * contractSize));
+                const maxAfford = Math.floor((walletBalance * LEVERAGE * 0.8) / (price * contractSize));
+                if (qty > maxAfford) qty = maxAfford;
 
-                if (aiApproved && aiConfidence >= 50) {
-                    const riskAmount = walletBalance * (currentRiskPercent / 100);
-                    let qty = Math.floor(riskAmount / (atr * dna.atrMultiplier * contractSize));
-                    const maxAfford = Math.floor((walletBalance * LEVERAGE * 0.8) / (price * contractSize));
-                    if (qty > maxAfford) qty = maxAfford;
+                if (qty >= 1) {
+                    const stopDist = atr * dna.atrMultiplier;
+                    const sl = action === 'LONG' ? price - stopDist : price + stopDist;
+                    const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                    if (qty >= 1) {
-                        const stopDist = atr * dna.atrMultiplier;
-                        const sl = action === 'LONG' ? price - stopDist : price + stopDist;
-                        const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
-
-                        // CHANGED TO MARKET ORDER HERE:
+                    try {
+                        // 1. ZERO-SLIPPAGE EXECUTION: Fire Market Order INSTANTLY (No waiting for AI)
                         await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
                         
                         lastOrderTime = Date.now();
-                        activePosition = { aiConfidence, slMovedToBreakeven: false }; 
+                        activePosition = { aiConfidence: 50, slMovedToBreakeven: false }; // Temporary until AI score arrives
+                        inTradeAiStatus = "Analyzing post-entry..."; // Show on Dashboard
+                        
+                        await sendNotification(`⚡ INSTANT ENTRY EXECUTED\nSide: ${action}\nMarket Price: ~$${price.toFixed(2)}\nSending to AI for background review...`);
 
-                        await sendNotification(`New Position Opened\nSide: ${action}\nMarket: ~$${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
-                    } else {
-                        console.log(`[WARNING] AI approved trade, but calculated QTY (${qty}) is less than 1 contract. Check Wallet Balance ($${walletBalance.toFixed(2)}).`);
+                        // 2. Calculate approximate guaranteed fee loss for an immediate abort
+                        const estFeeImpactRoe = (TAKER_FEE * 2 + SIMULATED_SLIPPAGE) * LEVERAGE * 100;
+
+                        // 3. ASYNC AI REVIEW: Runs in the background
+                        const prompt = `
+                        I just executed a ${action} on ${SYMBOL} instantly at $${price}. RSI was ${rsi.toFixed(2)} | SMA was $${sma100.toFixed(2)}.
+                        EOD Strategy: ${eodStrategyShift}
+                        Macro Context: ${aiMacroRegime}
+                        Recent Lessons: ${aiRecentLessons.join(" | ")}
+                        
+                        Review this executed trade. 
+                        CRITICAL: Aborting this trade now will guarantee an immediate ~${estFeeImpactRoe.toFixed(2)}% ROE loss due to exchange taker fees. 
+                        ONLY set "abort": true if you are highly confident the setup is a trap, violates our macro rules, and is heading straight for the Stop Loss. Otherwise, let it ride.
+                        
+                        Use JSON: {"abort": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
+                        
+                        askAIWithRetry(prompt, 1, 1000).then(async (aiDecision) => {
+                            // Verify the trade is still active and matches the side we just opened
+                            if (activePosition && (activePosition.side === undefined || activePosition.side === action)) { 
+                                activePosition.aiConfidence = aiDecision.confidence_score_1_to_100;
+                                inTradeAiStatus = `AI Review: ${aiDecision.reason}`;
+                                
+                                if (aiDecision.abort) {
+                                    console.log(`[AI EMERGENCY ABORT] Reason: ${aiDecision.reason}`);
+                                    await mexc.cancelAllOrders(SYMBOL).catch(e => console.log("Abort Cancel Error:", e.message));
+                                    await mexc.createMarketOrder(SYMBOL, action === 'LONG' ? 'sell' : 'buy', qty, undefined, { 'reduceOnly': true }).catch(e => console.log("Abort Market Error:", e.message));
+                                    await sendNotification(`🚨 AI EMERGENCY ABORT\nTrade closed immediately to protect capital from larger loss.\nReason: ${aiDecision.reason}`);
+                                } else {
+                                    console.log(`[AI APPROVED] Confidence: ${aiDecision.confidence_score_1_to_100}%`);
+                                }
+                            }
+                        }).catch(e => {
+                            inTradeAiStatus = "AI Review failed. Proceeding with standard trailing.";
+                            console.error("Async AI Review Failed:", e.message);
+                        });
+
+                    } catch (err) {
+                        console.error("Order Execution Error:", err.message);
                         lastOrderTime = Date.now() - 30000;
                     }
+
                 } else {
-                    console.log(`AI Rejected Trade: ${action}. Reason: ${aiNotes}`);
-                    lastOrderTime = Date.now() - 30000; 
+                    console.log(`[WARNING] Calculated QTY (${qty}) is less than 1 contract.`);
+                    lastOrderTime = Date.now() - 30000;
                 }
             }
         }
