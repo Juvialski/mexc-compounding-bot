@@ -1,5 +1,5 @@
 // ==========================================
-// Paste May 08, 2026 - ZERO SLIPPAGE + AI ABORT EDITION
+// Paste May 2026 - STEP-TRAILING & SMALL WINS EDITION
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -74,9 +74,9 @@ let latestRSI = 50, latestSMA = 0, latestATR = 0, htfTrendIndicator = "Awaiting 
 // ==========================================
 // AI NEW CO-PILOT STATES
 // ==========================================
-let currentRiskPercent = 5.0; // Dynamic AI managed
+let currentRiskPercent = 5.0; 
 let aiMacroRegime = "Awaiting MTF analysis...";
-let aiRecentLessons = ["No recent trades."];
+let aiRecentLessons =["No recent trades."];
 let eodStrategyShift = "Awaiting first End-Of-Day Debrief...";
 let latestAnomaly = "No anomalies detected yet.";
 let inTradeAiStatus = "No active trade.";
@@ -121,7 +121,6 @@ async function eodDebrief() {
     try {
         const past24h = new Date(Date.now() - (24 * 60 * 60 * 1000));
         const trades = await Trade.find({ time: { $gte: past24h } });
-        
         if(trades.length === 0) return;
 
         const wins = trades.filter(t => t.isWin).length;
@@ -317,19 +316,35 @@ async function tick() {
             const pnlUsd = (side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) * contracts * contractSize;
             const roe = (entryPrice > 0) ? ((side === 'LONG' ? (price - entryPrice) : (entryPrice - price)) / entryPrice) * LEVERAGE * 100 : 0;
             
-            const slMoved = activePosition?.slMovedToBreakeven || false;
-            activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe, aiConfidence: activePosition?.aiConfidence || 100, slMovedToBreakeven: slMoved };
+            // ==========================================
+            // DYNAMIC STEP-TRAILING LOGIC (REPLACES OLD BREAKEVEN)
+            // ==========================================
+            let maxRoe = activePosition?.maxRoe || roe;
+            if (roe > maxRoe) maxRoe = roe; // Track highest ROE reached
 
-            if (activePosition.slMovedToBreakeven) {
-                if ((side === 'LONG' && price <= entryPrice) || (side === 'SHORT' && price >= entryPrice)) {
-                    console.log("Internal Breakeven SL Hit. Closing via Market Order...");
-                    await mexc.cancelAllOrders(SYMBOL);
+            let lockedRoe = activePosition?.lockedRoe || 0;
+            
+            // Step up the guaranteed profit based on peak ROE
+            if (maxRoe >= 40 && lockedRoe < 25) lockedRoe = 25;
+            else if (maxRoe >= 25 && lockedRoe < 10) lockedRoe = 10;
+            else if (maxRoe >= 15 && lockedRoe < 3) lockedRoe = 3; // +3% covers taker fees and leaves a micro-profit
+
+            activePosition = { side, entry: entryPrice, size: contracts, pnlUsd, roe, maxRoe, lockedRoe, aiConfidence: activePosition?.aiConfidence || 100 };
+
+            // Trigger the market close if price falls back to our locked profit tier
+            if (lockedRoe > 0) {
+                const stopHit = (side === 'LONG' && roe <= lockedRoe) || (side === 'SHORT' && roe <= lockedRoe);
+                
+                if (stopHit) {
+                    console.log(`[PROFIT SECURED] Step-Trail hit at +${lockedRoe}% ROE. Executing Market Close...`);
+                    await mexc.cancelAllOrders(SYMBOL).catch(e=>console.log(e)); // Clear exchange TP/SL
                     await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
-                    inTradeAiStatus = "Closed at Breakeven.";
-                    return; 
+                    inTradeAiStatus = `Secured Step-Trail Win: +${lockedRoe}% ROE`;
+                    return; // Exit tick loop so DB sync logic catches it next run
                 }
             }
 
+            // AI In-Trade Checking (Simplified, no longer alters physical Stop Loss)
             if (Date.now() - lastInTradeCheck > 180000) {
                 lastInTradeCheck = Date.now();
                 try {
@@ -339,28 +354,23 @@ async function tick() {
                     1m RSI: ${rsi.toFixed(2)} | 1m SMA: $${sma100.toFixed(2)}.
                     Decide the best action:
                     - "HOLD": Let it run.
-                    - "CLOSE_EARLY": Momentum is dying, exit now.
-                    - "MOVE_SL_BREAKEVEN": Trade is safely in profit, protect capital.
-                    Use JSON: {"action": "HOLD" | "CLOSE_EARLY" | "MOVE_SL_BREAKEVEN", "reason": "brief reason"}`;
+                    - "CLOSE_EARLY": Momentum is dying, exit now to save capital or lock current profit.
+                    Use JSON: {"action": "HOLD" | "CLOSE_EARLY", "reason": "brief reason"}`;
                     
                     const aiDecision = await askAIWithRetry(prompt, 1, 1000);
-                    inTradeAiStatus = `[${formatPHT(new Date())}] Action: ${aiDecision.action} - ${aiDecision.reason}`;
+                    inTradeAiStatus = `[${formatPHT(new Date())}] AI: ${aiDecision.action} - ${aiDecision.reason}`;
                     
                     if (aiDecision.action === "CLOSE_EARLY") {
                         console.log("AI dictated CLOSE_EARLY. Executing...");
-                        await mexc.cancelAllOrders(SYMBOL);
+                        await mexc.cancelAllOrders(SYMBOL).catch(e=>{});
                         await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
                         await sendNotification(`AI Intervened: Closed Early. Reason: ${aiDecision.reason}`);
-                    } else if (aiDecision.action === "MOVE_SL_BREAKEVEN" && !activePosition.slMovedToBreakeven) {
-                        activePosition.slMovedToBreakeven = true;
-                        await mexc.cancelAllOrders(SYMBOL); 
-                        await sendNotification(`AI Intervened: Stop Loss moved to Breakeven. Reason: ${aiDecision.reason}`);
                     }
                 } catch(e) { console.error("In-Trade AI Check Failed."); }
             }
 
         } else if (activePosition && !rawPos) {
-            // Wait for DB/MEXC to sync if entry is undefined
+            // Position Closed - Save to DB
             if (activePosition.entry === undefined || activePosition.pnlUsd === undefined) {
                 if (Date.now() - lastOrderTime > 180000) { 
                     console.log("Order took too long to register. Canceling/Resetting...");
@@ -387,6 +397,7 @@ async function tick() {
             lastInTradeCheck = 0;
 
         } else if (Date.now() - lastOrderTime > 60000) {
+            // Entry Logic
             let action = null; let orderSide = null;
             if (price > sma100 && rsi < dna.rsiThreshold) { action = 'LONG'; orderSide = 'buy'; }
             else if (price < sma100 && rsi > (100 - dna.rsiThreshold)) { action = 'SHORT'; orderSide = 'sell'; }
@@ -403,19 +414,18 @@ async function tick() {
                     const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
                     try {
-                        // 1. ZERO-SLIPPAGE EXECUTION: Fire Market Order INSTANTLY (No waiting for AI)
+                        // 1. INSTANT EXECUTION (Keep exchange SL/TP as absolute safety nets)
                         await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
                         
                         lastOrderTime = Date.now();
-                        activePosition = { aiConfidence: 50, slMovedToBreakeven: false }; // Temporary until AI score arrives
-                        inTradeAiStatus = "Analyzing post-entry..."; // Show on Dashboard
+                        activePosition = { aiConfidence: 50, maxRoe: 0, lockedRoe: 0 }; 
+                        inTradeAiStatus = "Analyzing post-entry..."; 
                         
                         await sendNotification(`⚡ INSTANT ENTRY EXECUTED\nSide: ${action}\nMarket Price: ~$${price.toFixed(2)}\nSending to AI for background review...`);
 
-                        // 2. Calculate approximate guaranteed fee loss for an immediate abort
                         const estFeeImpactRoe = (TAKER_FEE * 2 + SIMULATED_SLIPPAGE) * LEVERAGE * 100;
 
-                        // 3. ASYNC AI REVIEW: Runs in the background
+                        // 3. ASYNC AI REVIEW 
                         const prompt = `
                         I just executed a ${action} on ${SYMBOL} instantly at $${price}. RSI was ${rsi.toFixed(2)} | SMA was $${sma100.toFixed(2)}.
                         EOD Strategy: ${eodStrategyShift}
@@ -429,7 +439,6 @@ async function tick() {
                         Use JSON: {"abort": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                         
                         askAIWithRetry(prompt, 1, 1000).then(async (aiDecision) => {
-                            // Verify the trade is still active and matches the side we just opened
                             if (activePosition && (activePosition.side === undefined || activePosition.side === action)) { 
                                 activePosition.aiConfidence = aiDecision.confidence_score_1_to_100;
                                 inTradeAiStatus = `AI Review: ${aiDecision.reason}`;
@@ -452,7 +461,6 @@ async function tick() {
                         console.error("Order Execution Error:", err.message);
                         lastOrderTime = Date.now() - 30000;
                     }
-
                 } else {
                     console.log(`[WARNING] Calculated QTY (${qty}) is less than 1 contract.`);
                     lastOrderTime = Date.now() - 30000;
@@ -480,11 +488,8 @@ app.get('/', async (req, res) => {
 
         const currentPrice = Number(lastTicker.last || 0);
         
-        // Calculate projected trade size to inform the user
         const estimatedRisk = walletBalance * (currentRiskPercent / 100);
         let idealQty = latestATR > 0 ? Math.floor(estimatedRisk / (latestATR * dna.atrMultiplier * contractSize)) : 0;
-        
-        // Apply the same margin cap the actual bot uses internally
         const maxAfford = currentPrice > 0 ? Math.floor((walletBalance * LEVERAGE * 0.8) / (currentPrice * contractSize)) : 0;
         
         let finalProjectedQty = idealQty;
@@ -496,14 +501,16 @@ app.get('/', async (req, res) => {
 
         let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center; margin:0; font-size:16px;">SCANNING MARKET (PRICE: $${currentPrice.toFixed(2)})</h2></div>`;
         if (activePosition && activePosition.side) {
+            const lockedText = activePosition.lockedRoe > 0 ? `<span class="text-green">+${activePosition.lockedRoe}% Locked</span>` : `<span class="text-muted">None</span>`;
+            
             activeCard = `
             <div class="card active-card pulse-border">
                 <div class="card-header"><h2 style="margin:0;"><span class="pulse-dot ${activePosition.side==='LONG'?'dot-green':'dot-red'}"></span> ACTIVE ${activePosition.side}</h2></div>
                 <div class="grid" style="margin-top:15px;">
                     <div class="stat-box"><span class="label">Entry</span><span class="value">$${(activePosition.entry || 0).toFixed(1)}</span></div>
-                    <div class="stat-box"><span class="label">ROE %</span><span class="value ${activePosition.roe >= 0 ? 'text-green' : 'text-red'}">${(activePosition.roe || 0).toFixed(2)}%</span></div>
+                    <div class="stat-box"><span class="label">Current ROE %</span><span class="value ${activePosition.roe >= 0 ? 'text-green' : 'text-red'}">${(activePosition.roe || 0).toFixed(2)}%</span></div>
                     <div class="stat-box"><span class="label">PnL USD</span><span class="value ${activePosition.pnlUsd >= 0 ? 'text-green' : 'text-red'}">$${(activePosition.pnlUsd || 0).toFixed(2)}</span></div>
-                    <div class="stat-box"><span class="label">Size / SL Status</span><span class="value">${activePosition.size} | ${activePosition.slMovedToBreakeven ? '<span class="text-yellow">BE HIT</span>' : 'Standard'}</span></div>
+                    <div class="stat-box"><span class="label">Secured Profit</span><span class="value">${lockedText}</span></div>
                 </div>
                 <div style="margin-top: 10px; font-size: 11px; color: var(--muted); background: rgba(0,0,0,0.3); padding: 5px; border-radius: 4px;">
                     <strong>🤖 Co-Pilot Status:</strong> ${inTradeAiStatus}
@@ -527,7 +534,7 @@ app.get('/', async (req, res) => {
                 .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
                 .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
                 .value { font-size: 14px; font-weight: 600; display: block; }
-                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); } .text-blue { color: var(--blue); }
+                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); } .text-blue { color: var(--blue); } .text-muted { color: var(--muted); }
                 .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
                 .badge-green { background: rgba(16,185,129,0.2); color: var(--green); } .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
                 table { width: 100%; border-collapse: collapse; } th { text-align: left; font-size: 11px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); } td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
