@@ -147,7 +147,7 @@ async function eodDebrief() {
 // ==========================================
 async function analyzeMarketState() {
     try {
-        const [ohlcv1m, ohlcv15m, ohlcv1h, ohlcv4h] = await Promise.all([
+        const[ohlcv1m, ohlcv15m, ohlcv1h, ohlcv4h] = await Promise.all([
             mexc.fetchOHLCV(SYMBOL, '1m', undefined, 50),
             mexc.fetchOHLCV(SYMBOL, '15m', undefined, 50),
             mexc.fetchOHLCV(SYMBOL, '1h', undefined, 50),
@@ -252,7 +252,7 @@ async function evolve() {
         };
 
         let results =[];
-        for (let r of [35, 40, 45, 50]) for (let a of [1.5, 2.0, 2.5]) for (let rr of [1.5, 2.0, 2.5, 3.0]) results.push(testSettings(r, a, rr));
+        for (let r of [35, 40, 45, 50]) for (let a of[1.5, 2.0, 2.5]) for (let rr of[1.5, 2.0, 2.5, 3.0]) results.push(testSettings(r, a, rr));
         results.sort((a, b) => b.score - a.score);
         
         const top = results[0];
@@ -360,13 +360,32 @@ async function tick() {
             }
 
         } else if (activePosition && !rawPos) {
+            // --- BUG FIX START: Handle pending Limit Orders ---
+            if (activePosition.entry === undefined || activePosition.pnlUsd === undefined) {
+                // If order has been pending for more than 3 minutes, cancel it so the bot doesn't get stuck
+                if (Date.now() - lastOrderTime > 180000) { 
+                    console.log("Limit order took too long to fill. Canceling...");
+                    await mexc.cancelAllOrders(SYMBOL).catch(e=>console.log(e));
+                    activePosition = null; 
+                }
+                return; // Exit this tick and wait for the order to fill
+            }
+            // --- BUG FIX END ---
+
             const finalRoe = (activePosition.entry > 0) ? (((activePosition.side === 'LONG' ? (price - activePosition.entry) : (activePosition.entry - price)) / activePosition.entry) * LEVERAGE * 100) : 0;
             const tradeToSave = { 
                 side: activePosition.side, entry: activePosition.entry, exit: price, pnlUsd: activePosition.pnlUsd, 
                 pnlPercent: finalRoe, equityAfter: walletBalance + activePosition.pnlUsd, 
                 isWin: activePosition.pnlUsd > 0, time: new Date(), aiConfidence: activePosition.aiConfidence 
             };
-            await Trade.create(tradeToSave);
+            
+            // Added Try/Catch so DB errors never crash the main bot loop again
+            try {
+                await Trade.create(tradeToSave);
+            } catch (dbErr) {
+                console.error("DB Save Error, ignoring to keep bot alive:", dbErr.message);
+            }
+
             await sendNotification(`Position Closed\nSide: ${activePosition.side}\nExit: $${price.toFixed(2)}\nPnL: $${activePosition.pnlUsd.toFixed(2)} (${finalRoe.toFixed(2)}%)`);
             postTradeReflection(tradeToSave);
             activePosition = null;
