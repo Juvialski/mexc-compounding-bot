@@ -360,11 +360,11 @@ async function tick() {
             }
 
         } else if (activePosition && !rawPos) {
-            // --- BUG FIX START: Handle pending Limit Orders ---
+            // --- BUG FIX START: Handle pending Limit/Market Orders ---
             if (activePosition.entry === undefined || activePosition.pnlUsd === undefined) {
                 // If order has been pending for more than 3 minutes, cancel it so the bot doesn't get stuck
                 if (Date.now() - lastOrderTime > 180000) { 
-                    console.log("Limit order took too long to fill. Canceling...");
+                    console.log("Order took too long to register. Canceling/Resetting...");
                     await mexc.cancelAllOrders(SYMBOL).catch(e=>console.log(e));
                     activePosition = null; 
                 }
@@ -424,11 +424,13 @@ async function tick() {
                         const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                         const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
+                        // CHANGED TO MARKET ORDER HERE:
+                        await mexc.createOrder(SYMBOL, 'market', orderSide, qty, undefined, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
+                        
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence, slMovedToBreakeven: false }; 
 
-                        await sendNotification(`New Position Opened\nSide: ${action}\nLimit: $${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
+                        await sendNotification(`New Position Opened\nSide: ${action}\nMarket: ~$${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
                     } else {
                         console.log(`[WARNING] AI approved trade, but calculated QTY (${qty}) is less than 1 contract. Check Wallet Balance ($${walletBalance.toFixed(2)}).`);
                         lastOrderTime = Date.now() - 30000;
