@@ -1,5 +1,5 @@
 // ==========================================
-// Paste May 07, 2026 - UPGRADED AI EDITION (WITH LIVE RADAR RESTORED)
+// Paste May 08, 2026 - UPGRADED AI EDITION (WITH BUG FIXES & ENHANCED UI)
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -115,7 +115,7 @@ async function pruneDatabase() {
 }
 
 // ==========================================
-// IMPROVEMENT 5: END-OF-DAY MASTER DEBRIEF
+// EOD DEBRIEF
 // ==========================================
 async function eodDebrief() {
     try {
@@ -143,7 +143,7 @@ async function eodDebrief() {
 }
 
 // ==========================================
-// IMPROVEMENT 3 & 2: MTF CONFLUENCE & DYNAMIC RISK
+// MTF CONFLUENCE & DYNAMIC RISK
 // ==========================================
 async function analyzeMarketState() {
     try {
@@ -193,7 +193,7 @@ async function analyzeMarketState() {
 }
 
 // ==========================================
-// PILLAR 4: POST-TRADE REFLECTION
+// POST-TRADE REFLECTION
 // ==========================================
 async function postTradeReflection(tradeData) {
     try {
@@ -212,7 +212,7 @@ async function postTradeReflection(tradeData) {
 }
 
 // ==========================================
-// PILLAR 1: EVOLUTION ENGINE
+// EVOLUTION ENGINE
 // ==========================================
 async function evolve() {
     try {
@@ -287,12 +287,12 @@ async function tick() {
         latestRSI = rsi; latestSMA = sma100; latestATR = atr;
         htfTrendIndicator = price > sma60 ? "Bullish" : "Bearish";
 
-        // Console log for watching target (from original code)
+        // Console log for watching target
         if (!activePosition && (rsi < dna.rsiThreshold + 10 || rsi > (100 - dna.rsiThreshold) - 10)) {
             console.log(`[WATCHING] Price: $${price} | 1m SMA100: $${sma100.toFixed(2)} | 1m RSI: ${rsi.toFixed(2)} | Target: <${dna.rsiThreshold} or >${100 - dna.rsiThreshold}`);
         }
 
-        // --- IMPROVEMENT 4: VOLUME ANOMALY DETECTOR ---
+        // VOLUME ANOMALY DETECTOR
         if (!activePosition && currentVol > (volSMA * 3.5) && Date.now() > volumeAnomalyCooldown) {
             console.log("Volume Anomaly Detected! Asking AI...");
             try {
@@ -405,11 +405,16 @@ async function tick() {
                         const sl = action === 'LONG' ? price - stopDist : price + stopDist;
                         const tp = action === 'LONG' ? price + (stopDist * dna.rewardRatio) : price - (stopDist * dna.rewardRatio);
 
-                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)), 'postOnly': true });
+                        // FIX: Removed postOnly to prevent silent rejections of valid trades
+                        await mexc.createOrder(SYMBOL, 'limit', orderSide, qty, price, { 'stopLoss': parseFloat(sl.toFixed(2)), 'takeProfit': parseFloat(tp.toFixed(2)) });
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence, slMovedToBreakeven: false }; 
 
                         await sendNotification(`New Position Opened\nSide: ${action}\nLimit: $${price.toFixed(2)}\nRisk: ${currentRiskPercent}%\nAI Confidence: ${aiConfidence}%\nNotes: ${aiNotes}`);
+                    } else {
+                        // FIX: Added logging if account balance is too low to trade
+                        console.log(`[WARNING] AI approved trade, but calculated QTY (${qty}) is less than 1 contract. Check Wallet Balance ($${walletBalance.toFixed(2)}).`);
+                        lastOrderTime = Date.now() - 30000;
                     }
                 } else {
                     console.log(`AI Rejected Trade: ${action}. Reason: ${aiNotes}`);
@@ -436,7 +441,13 @@ app.get('/', async (req, res) => {
         const totalCount = await Trade.countDocuments();
         const winRate = totalCount > 0 ? ((winCount / totalCount) * 100).toFixed(1) : 0;
 
-        let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center; margin:0;">SCANNING MARKET...</h2></div>`;
+        const currentPrice = Number(lastTicker.last || 0);
+        
+        // Calculate projected trade size to inform the user
+        const estimatedRisk = walletBalance * (currentRiskPercent / 100);
+        let projectedQty = latestATR > 0 ? Math.floor(estimatedRisk / (latestATR * dna.atrMultiplier * contractSize)) : 0;
+
+        let activeCard = `<div class="card active-card"><h2 style="color:var(--muted); text-align:center; margin:0; font-size:16px;">SCANNING MARKET (PRICE: $${currentPrice.toFixed(2)})</h2></div>`;
         if (activePosition && activePosition.side) {
             activeCard = `
             <div class="card active-card pulse-border">
@@ -460,8 +471,8 @@ app.get('/', async (req, res) => {
                 :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; --yellow: #eab308; }
                 body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 15px; margin: 0; }
                 .container { max-width: 900px; margin: auto; }
-                .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-                .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+                .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+                .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
                 .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 15px; margin-bottom: 15px; }
                 .stat-title { color: var(--muted); font-size: 11px; text-transform: uppercase; }
                 .stat-value { font-size: 18px; font-weight: 800; margin-top: 5px; }
@@ -469,35 +480,43 @@ app.get('/', async (req, res) => {
                 .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
                 .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
                 .value { font-size: 14px; font-weight: 600; display: block; }
-                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); }
+                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); } .text-blue { color: var(--blue); }
                 .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
                 .badge-green { background: rgba(16,185,129,0.2); color: var(--green); } .badge-red { background: rgba(239,68,68,0.2); color: var(--red); }
                 table { width: 100%; border-collapse: collapse; } th { text-align: left; font-size: 11px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); } td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
                 .pulse-dot { height: 8px; width: 8px; border-radius: 50%; display: inline-block; margin-right: 5px; } .dot-green { background: var(--green); } .dot-red { background: var(--red); }
                 .pulse-border { animation: border-pulse 2s infinite; }
                 .ai-box { padding: 12px; border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; border-left: 3px solid; }
+                .timestamp { font-size: 10px; color: var(--muted); }
                 @keyframes border-pulse { 0%, 100% { border-color: var(--blue); } 50% { border-color: var(--border); } }
             </style></head>
             <body><div class="container">
-                <h2 style="text-align:center; color:var(--purple); margin-top:5px; margin-bottom:20px;">SNIPER AI CO-PILOT (PRO)</h2>
-                <div class="grid">
-                    <div class="card"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
-                    <div class="card"><div class="stat-title">Risk Allocation</div><div class="stat-value text-purple">${currentRiskPercent.toFixed(1)}% / Trade</div></div>
-                    <div class="card"><div class="stat-title">Net Profit</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(2)}</div></div>
-                    <div class="card"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
+                <div class="header-flex">
+                    <h2 style="color:var(--purple); margin:0;">SNIPER AI CO-PILOT</h2>
+                    <span class="timestamp">Last Refresh: ${new Date().toLocaleTimeString()}</span>
                 </div>
+
+                <div class="grid" style="margin-bottom: 15px;">
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">BTC/USDT</div><div class="stat-value text-blue">$${currentPrice.toFixed(2)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Risk Allocation</div><div class="stat-value text-purple">${currentRiskPercent.toFixed(1)}%</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Net Profit</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(2)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Win Rate</div><div class="stat-value">${winRate}%</div></div>
+                </div>
+
                 ${activeCard}
 
                 <div class="card">
                     <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Live Technical Radar</h3>
-                    <div class="grid-3">
+                    <div class="grid">
                         <div class="stat-box"><span class="label">1m RSI</span><span class="value ${latestRSI < dna.rsiThreshold + 5 || latestRSI > (100 - dna.rsiThreshold) - 5 ? 'text-yellow' : ''}">${latestRSI.toFixed(2)}</span></div>
                         <div class="stat-box"><span class="label">Target LONG</span><span class="value text-green">< ${dna.rsiThreshold}</span></div>
                         <div class="stat-box"><span class="label">Target SHORT</span><span class="value text-red">> ${100 - dna.rsiThreshold}</span></div>
                         <div class="stat-box"><span class="label">100 SMA</span><span class="value">$${latestSMA.toFixed(2)}</span></div>
-                        <div class="stat-box"><span class="label">1m ATR Volatility</span><span class="value">$${latestATR.toFixed(4)}</span></div>
                         <div class="stat-box"><span class="label">1H Trend Context</span><span class="value ${htfTrendIndicator === 'Bullish' ? 'text-green' : 'text-red'}">${htfTrendIndicator}</span></div>
+                        <div class="stat-box"><span class="label">Projected Trade Size</span><span class="value ${projectedQty < 1 ? 'text-red' : 'text-purple'}">${projectedQty} Contracts</span></div>
                     </div>
+                    ${projectedQty < 1 ? '<div style="margin-top:10px; font-size:11px; color:var(--red); text-align:center;">⚠️ Projected Trade Size is 0. Increase wallet balance or AI Risk % to trade.</div>' : ''}
                 </div>
                 
                 <div class="card">
