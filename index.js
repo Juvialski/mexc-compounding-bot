@@ -1,49 +1,68 @@
 // ==========================================
-// Paste May 2026 - GITHUB MODELS (GPT-4o) & MACD EDITION
-// Designed for Render Deployment
+// Paste May 2026 - HYBRID AI EDITION (GitHub GPT-4o-mini + Gemini)
+// Designed for 24/7 Render Deployment
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
 const { RSI, SMA, ATR, MACD } = require('technicalindicators');
-const { OpenAI } = require('openai'); // GitHub Models uses the OpenAI SDK format
+const { OpenAI } = require('openai'); 
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-const port = process.env.PORT || 10000; // Render dynamically assigns PORT
+const port = process.env.PORT || 10000; 
 
 // ==========================================
-// GITHUB MODELS AI SETUP (GPT-4o)
+// DUAL-AI SETUP
 // ==========================================
-const aiClient = new OpenAI({
+// 1. GitHub Models (Used for critical JSON execution: Entry Review, EOD Debrief)
+const githubAI = new OpenAI({
     baseURL: "https://models.inference.ai.azure.com",
-    apiKey: process.env.GITHUB_TOKEN // Set this in Render Environment Variables
+    apiKey: process.env.GITHUB_TOKEN 
 });
 
-async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
+// 2. Google Gemini (Used for high-frequency checks: MTF, In-Trade, Anomalies)
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ 
+    model: "gemini-3.1-flash-lite-preview", 
+    generationConfig: { responseMimeType: "application/json" }
+});
+
+async function askGitHubAI(prompt, maxRetries = 3) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            const response = await aiClient.chat.completions.create({
-                model: "gpt-4o", 
+            const response = await githubAI.chat.completions.create({
+                model: "gpt-4o-mini", // Very capable, higher daily limits
                 messages:[
-                    { role: "system", content: "You are an elite quantitative crypto trading AI. You must ALWAYS respond in valid JSON format." },
+                    { role: "system", content: "You are an elite quantitative crypto trading AI. ALWAYS respond in valid JSON." },
                     { role: "user", content: prompt }
                 ],
-                response_format: { type: "json_object" }, // Strict JSON mode to prevent crashes
+                response_format: { type: "json_object" },
                 temperature: 0.2
             });
-            
-            const responseText = response.choices[0].message.content.trim();
+            return JSON.parse(response.choices[0].message.content.trim());
+        } catch (error) {
+            if (attempt === maxRetries) throw error;
+            await new Promise(r => setTimeout(r, 5000 * attempt));
+        }
+    }
+}
+
+async function askGeminiAI(prompt, maxRetries = 3) {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            const result = await geminiModel.generateContent(prompt);
+            let responseText = result.response.text().trim();
+            if (responseText.startsWith('```json')) responseText = responseText.replace(/^```json/, '').replace(/```$/, '').trim();
+            else if (responseText.startsWith('```')) responseText = responseText.replace(/^```/, '').replace(/```$/, '').trim();
             return JSON.parse(responseText);
         } catch (error) {
-            const isRateLimit = error.status === 429 || error.status === 503;
+            const isRateLimit = error.message && (error.message.includes('429') || error.message.includes('503'));
             if (isRateLimit && attempt < maxRetries) {
-                const delay = error.status === 429 ? 60000 : baseDelayMs * attempt; 
-                console.warn(`GitHub AI API Limit. Retrying attempt ${attempt + 1} in ${delay / 1000}s...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-            } else {
-                console.error(`AI API Error: ${error.message}`);
-                throw error; 
+                await new Promise(r => setTimeout(r, 10000 * attempt));
+            } else if (attempt === maxRetries) {
+                throw error;
             }
         }
     }
@@ -80,10 +99,8 @@ let latestRSI = 50, latestSMA = 0, latestATR = 0;
 let htfTrendIndicator = "Awaiting tick...";
 let latestMACD = { MACD: 0, signal: 0, histogram: 0 };
 
-// ==========================================
-// AI NEW CO-PILOT STATES
-// ==========================================
-let currentRiskPercent = 3.0; // Reduced default risk for safety
+// AI States
+let currentRiskPercent = 3.0; 
 let aiMacroRegime = "Awaiting MTF analysis...";
 let aiRecentLessons = ["No recent trades."];
 let eodStrategyShift = "Awaiting first End-Of-Day Debrief...";
@@ -100,9 +117,7 @@ const formatPHT = (dateInput) => {
 async function sendNotification(message) {
     const webhookUrl = process.env.WEBHOOK_URL; 
     if (!webhookUrl) return; 
-    try {
-        await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `**Sniper AI Co-Pilot**\n${message}` }) });
-    } catch (e) { }
+    try { await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `**Sniper AI Co-Pilot**\n${message}` }) }); } catch (e) { }
 }
 
 // ==========================================
@@ -119,12 +134,11 @@ const Trade = mongoose.model('Trade', new mongoose.Schema({
 }));
 
 async function pruneDatabase() {
-    try { await Trade.deleteMany({ time: { $lt: new Date(Date.now() - (30 * 24 * 60 * 60 * 1000)) } }); } 
-    catch (e) { }
+    try { await Trade.deleteMany({ time: { $lt: new Date(Date.now() - (30 * 24 * 60 * 60 * 1000)) } }); } catch (e) { }
 }
 
 // ==========================================
-// EOD DEBRIEF
+// EOD DEBRIEF (Task for GitHub / GPT)
 // ==========================================
 async function eodDebrief() {
     try {
@@ -136,24 +150,19 @@ async function eodDebrief() {
         const total = trades.length;
         const pnl = trades.reduce((sum, t) => sum + (t.pnlPercent || 0), 0);
 
-        const prompt = `
-        Review the last 24h of crypto scalping.
-        Total Trades: ${total} | Wins: ${wins} | Net PnL: ${pnl.toFixed(2)}%.
-        Recent Lessons learned: ${aiRecentLessons.join(" | ")}.
-        Provide an End-of-Day debrief and dictate a strategy rule for the bot to follow tomorrow.
-        Respond in JSON: {"daily_summary": "1 sentence recap", "tomorrow_strategy": "1 sentence strict rule"}`;
+        const prompt = `Review the last 24h of crypto scalping. Total Trades: ${total} | Wins: ${wins} | Net PnL: ${pnl.toFixed(2)}%. Recent Lessons: ${aiRecentLessons.join(" | ")}. Provide an End-of-Day debrief and dictate a strategy rule for tomorrow. Respond in JSON: {"daily_summary": "1 sentence recap", "tomorrow_strategy": "1 sentence strict rule"}`;
 
-        const aiDecision = await askAIWithRetry(prompt);
+        const aiDecision = await askGitHubAI(prompt);
         if(aiDecision.daily_summary && aiDecision.tomorrow_strategy) {
             eodStrategyShift = `Summary: ${aiDecision.daily_summary} | Rule: ${aiDecision.tomorrow_strategy}`;
-            console.log(`[EOD DEBRIEF] ${eodStrategyShift}`);
-            sendNotification(`EOD Master Debrief Completed\nStrategy Shift: ${aiDecision.tomorrow_strategy}`);
+            console.log(`[EOD DEBRIEF - GitHub] ${eodStrategyShift}`);
+            sendNotification(`EOD Master Debrief (GPT-4o-mini)\nStrategy Shift: ${aiDecision.tomorrow_strategy}`);
         }
     } catch (e) { console.error("EOD Debrief Error:", e.message); }
 }
 
 // ==========================================
-// MTF CONFLUENCE & DYNAMIC RISK
+// MTF CONFLUENCE & DYNAMIC RISK (Task for Gemini)
 // ==========================================
 async function analyzeMarketState() {
     try {
@@ -166,11 +175,7 @@ async function analyzeMarketState() {
 
         const getStats = (candles) => {
             const closes = candles.map(c => c[4]);
-            return {
-                price: closes[closes.length - 1],
-                rsi: RSI.calculate({ period: 14, values: closes }).pop() || 50,
-                sma: SMA.calculate({ period: 20, values: closes }).pop() || 0
-            };
+            return { price: closes[closes.length - 1], rsi: RSI.calculate({ period: 14, values: closes }).pop() || 50, sma: SMA.calculate({ period: 20, values: closes }).pop() || 0 };
         };
 
         const m1 = getStats(ohlcv1m); const m15 = getStats(ohlcv15m);
@@ -180,42 +185,29 @@ async function analyzeMarketState() {
         const wins = recentTrades.filter(t => t.isWin).length;
         const winRate = recentTrades.length > 0 ? (wins / recentTrades.length) * 100 : 50;
 
-        const prompt = `
-        Current Account Balance: $${walletBalance.toFixed(2)} | Recent Win Rate: ${winRate.toFixed(0)}%.
+        const prompt = `Account Balance: $${walletBalance.toFixed(2)} | Recent Win Rate: ${winRate.toFixed(0)}%.
         Timeframe Data for ${SYMBOL}:
-        - 1m: Price $${m1.price}, RSI ${m1.rsi.toFixed(1)}, SMA $${m1.sma.toFixed(1)}
-        - 15m: RSI ${m15.rsi.toFixed(1)}, SMA $${m15.sma.toFixed(1)}
-        - 1H: RSI ${h1.rsi.toFixed(1)}, SMA $${h1.sma.toFixed(1)}
-        - 4H: RSI ${h4.rsi.toFixed(1)}, SMA $${h4.sma.toFixed(1)}
-
-        1. Determine the overarching regime (Confluence).
-        2. Set a strict rule for 1m scalping based on the MTF alignment.
-        3. Recommend a dynamic Risk % per trade (between 1.0 and 5.0). Lower risk if choppy or win rate is low.
+        - 1m: P $${m1.price}, RSI ${m1.rsi.toFixed(1)}, SMA $${m1.sma.toFixed(1)}
+        - 15m: RSI ${m15.rsi.toFixed(1)} | 1H: RSI ${h1.rsi.toFixed(1)} | 4H: RSI ${h4.rsi.toFixed(1)}
+        Determine overarching regime, rule for 1m scalping, and recommend Risk % (1.0 - 5.0).
         Respond in JSON: {"regime": "short description", "advice": "1 sentence rule", "recommended_risk_percent": 3.0}`;
 
-        const aiDecision = await askAIWithRetry(prompt);
-
+        const aiDecision = await askGeminiAI(prompt);
         if(aiDecision.regime && aiDecision.recommended_risk_percent) {
             aiMacroRegime = `${aiDecision.regime} - ${aiDecision.advice}`;
             currentRiskPercent = aiDecision.recommended_risk_percent;
-            console.log(`[MTF Analyzed] Regime: ${aiMacroRegime} | New Risk: ${currentRiskPercent}%`);
+            console.log(`[MTF Analyzed - Gemini] Regime: ${aiMacroRegime} | New Risk: ${currentRiskPercent}%`);
         }
     } catch (e) { console.error("Macro Analysis Error:", e.message); }
 }
 
 // ==========================================
-// POST-TRADE REFLECTION
+// POST-TRADE REFLECTION (Task for Gemini)
 // ==========================================
 async function postTradeReflection(tradeData) {
     try {
-        const prompt = `
-        Trade closed on ${SYMBOL}. Side: ${tradeData.side} | PnL: ${tradeData.pnlPercent.toFixed(2)}%.
-        AI Confidence on entry: ${tradeData.aiConfidence}%.
-        Provide a 1-sentence lesson learned to improve future setups.
-        Respond in JSON: {"lesson": "your 1 sentence lesson"}`;
-
-        const aiDecision = await askAIWithRetry(prompt);
-
+        const prompt = `Trade closed on ${SYMBOL}. Side: ${tradeData.side} | PnL: ${tradeData.pnlPercent.toFixed(2)}%. Provide a 1-sentence lesson learned. Respond in JSON: {"lesson": "your 1 sentence lesson"}`;
+        const aiDecision = await askGeminiAI(prompt);
         if(aiDecision.lesson) {
             if (aiRecentLessons[0] === "No recent trades.") aiRecentLessons.shift();
             aiRecentLessons.push(`[${tradeData.pnlPercent > 0 ? 'WIN' : 'LOSS'}] ${aiDecision.lesson}`);
@@ -298,7 +290,6 @@ async function tick() {
         const volSMA = SMA.calculate({ period: 20, values: volumes }).pop() || 1;
         const currentVol = volumes[volumes.length - 1];
 
-        // MACD Calculation for momentum filtering
         const macdData = MACD.calculate({ values: closes, fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false });
         latestMACD = macdData.length ? macdData[macdData.length - 1] : { MACD: 0, signal: 0, histogram: 0 };
 
@@ -306,19 +297,14 @@ async function tick() {
         htfTrendIndicator = price > sma60 ? "Bullish" : "Bearish";
 
         if (!activePosition && (rsi < dna.rsiThreshold + 5 || rsi > (100 - dna.rsiThreshold) - 5)) {
-            console.log(`[WATCHING] P: $${price} | SMA100: $${sma100.toFixed(2)} | RSI: ${rsi.toFixed(2)} | MACD Hist: ${latestMACD.histogram.toFixed(2)}`);
+            console.log(`[WATCHING] P: $${price} | SMA100: $${sma100.toFixed(2)} | RSI: ${rsi.toFixed(2)} | MACD: ${latestMACD.histogram.toFixed(2)}`);
         }
 
-        // VOLUME ANOMALY DETECTOR
+        // VOLUME ANOMALY DETECTOR (Task for Gemini)
         if (!activePosition && currentVol > (volSMA * 4.0) && Date.now() > volumeAnomalyCooldown) {
             try {
-                const prompt = `
-                Volume Spike on ${SYMBOL} 1m chart! Current Volume is ${currentVol.toFixed(2)} (400% above SMA).
-                Price is $${price}, RSI is ${rsi.toFixed(2)}. 
-                Is this a breakout or a fakeout?
-                Respond in JSON: {"is_manipulation": true/false, "advice": "short explanation"}`;
-                
-                const aiDecision = await askAIWithRetry(prompt, 1, 1000);
+                const prompt = `Volume Spike on ${SYMBOL} 1m chart! Volume is ${currentVol.toFixed(2)} (400% above SMA). Price $${price}, RSI ${rsi.toFixed(2)}. Is this a breakout or a fakeout? Respond in JSON: {"is_manipulation": true/false, "advice": "short explanation"}`;
+                const aiDecision = await askGeminiAI(prompt, 1);
                 if(aiDecision.advice) {
                     latestAnomaly = `Detected at ${formatPHT(new Date())} - ${aiDecision.advice}`;
                     volumeAnomalyCooldown = Date.now() + (15 * 60 * 1000); 
@@ -339,7 +325,6 @@ async function tick() {
             if (roe > maxRoe) maxRoe = roe; 
 
             let lockedRoe = activePosition?.lockedRoe || 0;
-            
             if (maxRoe >= 40 && lockedRoe < 25) lockedRoe = 25;
             else if (maxRoe >= 25 && lockedRoe < 10) lockedRoe = 10;
             else if (maxRoe >= 15 && lockedRoe < 3) lockedRoe = 3; 
@@ -357,27 +342,18 @@ async function tick() {
                 }
             }
 
-            // In-Trade AI Checking
+            // In-Trade AI Checking (Task for Gemini)
             if (Date.now() - lastInTradeCheck > 180000) {
                 lastInTradeCheck = Date.now();
                 try {
-                    const prompt = `
-                    Active ${side} trade on ${SYMBOL}.
-                    Entry: $${entryPrice} | Current Price: $${price} | ROE: ${roe.toFixed(2)}%.
-                    1m RSI: ${rsi.toFixed(2)} | MACD Histogram: ${latestMACD.histogram.toFixed(2)}.
-                    Decide:
-                    - "HOLD": Let it run.
-                    - "CLOSE_EARLY": Momentum dying, exit now.
-                    Respond in JSON: {"action": "HOLD" | "CLOSE_EARLY", "reason": "brief reason"}`;
-                    
-                    const aiDecision = await askAIWithRetry(prompt, 1, 1000);
+                    const prompt = `Active ${side} on ${SYMBOL}. Entry: $${entryPrice} | Price: $${price} | ROE: ${roe.toFixed(2)}%. 1m RSI: ${rsi.toFixed(2)} | MACD: ${latestMACD.histogram.toFixed(2)}. Decide: "HOLD" or "CLOSE_EARLY". Respond in JSON: {"action": "HOLD" | "CLOSE_EARLY", "reason": "brief reason"}`;
+                    const aiDecision = await askGeminiAI(prompt, 1);
                     if(aiDecision.action) {
-                        inTradeAiStatus = `[${formatPHT(new Date())}] AI: ${aiDecision.action} - ${aiDecision.reason}`;
-                        
+                        inTradeAiStatus = `[${formatPHT(new Date())}] Gemini: ${aiDecision.action} - ${aiDecision.reason}`;
                         if (aiDecision.action === "CLOSE_EARLY") {
                             await mexc.cancelAllOrders(SYMBOL).catch(()=>{});
                             await mexc.createMarketOrder(SYMBOL, side === 'LONG' ? 'sell' : 'buy', contracts, undefined, { 'reduceOnly': true });
-                            await sendNotification(`AI Intervened: Closed Early. Reason: ${aiDecision.reason}`);
+                            await sendNotification(`Gemini Intervened: Closed Early. Reason: ${aiDecision.reason}`);
                         }
                     }
                 } catch(e) {}
@@ -406,23 +382,13 @@ async function tick() {
             activePosition = null;
             inTradeAiStatus = "No active trade.";
             lastInTradeCheck = 0;
-            lastOrderTime = Date.now(); // Cooldown
+            lastOrderTime = Date.now(); 
 
         } else if (Date.now() - lastOrderTime > 120000) { 
             
-            // ==========================================
-            // IMPROVED ENTRY LOGIC (RSI + SMA + MACD MOMENTUM)
-            // ==========================================
             let action = null; let orderSide = null;
-            
-            // LONG: Price above 100 SMA, RSI Oversold, and MACD Histogram is positive or growing
-            if (price > sma100 && rsi < dna.rsiThreshold && latestMACD.histogram > 0) { 
-                action = 'LONG'; orderSide = 'buy'; 
-            }
-            // SHORT: Price below 100 SMA, RSI Overbought, and MACD Histogram is negative or dropping
-            else if (price < sma100 && rsi > (100 - dna.rsiThreshold) && latestMACD.histogram < 0) { 
-                action = 'SHORT'; orderSide = 'sell'; 
-            }
+            if (price > sma100 && rsi < dna.rsiThreshold && latestMACD.histogram > 0) { action = 'LONG'; orderSide = 'buy'; }
+            else if (price < sma100 && rsi > (100 - dna.rsiThreshold) && latestMACD.histogram < 0) { action = 'SHORT'; orderSide = 'sell'; }
 
             if (action) {
                 const riskAmount = walletBalance * (currentRiskPercent / 100);
@@ -440,30 +406,25 @@ async function tick() {
                         
                         lastOrderTime = Date.now();
                         activePosition = { aiConfidence: 50, maxRoe: 0, lockedRoe: 0 }; 
-                        inTradeAiStatus = "Analyzing post-entry..."; 
+                        inTradeAiStatus = "Analyzing post-entry via GitHub GPT..."; 
                         
-                        await sendNotification(`⚡ INSTANT ENTRY EXECUTED\nSide: ${action}\nMarket Price: ~$${price.toFixed(2)}`);
+                        await sendNotification(`⚡ INSTANT ENTRY EXECUTED\nSide: ${action}\nMarket Price: ~$${price.toFixed(2)}\nReviewing with GitHub AI...`);
 
-                        const prompt = `
-                        Executed ${action} on ${SYMBOL} instantly at $${price}. RSI: ${rsi.toFixed(2)} | MACD Hist: ${latestMACD.histogram.toFixed(2)}.
-                        EOD Strategy: ${eodStrategyShift}
-                        Recent Lessons: ${aiRecentLessons.join(" | ")}
+                        // Entry Review (CRITICAL Task for GitHub / GPT-4o-mini)
+                        const prompt = `Executed ${action} on ${SYMBOL} at $${price}. RSI: ${rsi.toFixed(2)} | MACD: ${latestMACD.histogram.toFixed(2)}. EOD Strategy: ${eodStrategyShift}. ONLY set "abort": true if setup is a confirmed fakeout violating macro rules. Respond in JSON: {"abort": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
                         
-                        CRITICAL: Aborting triggers immediate taker fees. ONLY set "abort": true if setup is a confirmed fakeout violating macro rules.
-                        Respond in JSON: {"abort": true/false, "confidence_score_1_to_100": 85, "reason": "brief reason"}`;
-                        
-                        askAIWithRetry(prompt, 1, 1000).then(async (aiDecision) => {
+                        askGitHubAI(prompt, 1).then(async (aiDecision) => {
                             if (activePosition && (activePosition.side === undefined || activePosition.side === action)) { 
                                 activePosition.aiConfidence = aiDecision.confidence_score_1_to_100;
-                                inTradeAiStatus = `AI Review: ${aiDecision.reason}`;
+                                inTradeAiStatus = `GPT Review: ${aiDecision.reason}`;
                                 
                                 if (aiDecision.abort) {
                                     await mexc.cancelAllOrders(SYMBOL).catch(()=>{});
                                     await mexc.createMarketOrder(SYMBOL, action === 'LONG' ? 'sell' : 'buy', qty, undefined, { 'reduceOnly': true });
-                                    await sendNotification(`🚨 AI EMERGENCY ABORT\nTrade closed immediately.\nReason: ${aiDecision.reason}`);
+                                    await sendNotification(`🚨 GPT EMERGENCY ABORT\nTrade closed immediately.\nReason: ${aiDecision.reason}`);
                                 }
                             }
-                        }).catch(()=>{});
+                        }).catch(()=>{ inTradeAiStatus = "GPT Review failed, holding position."; });
 
                     } catch (err) {
                         console.error("Order Execution Error:", err.message);
@@ -510,13 +471,13 @@ app.get('/', async (req, res) => {
                     <div class="stat-box"><span class="label">Secured Profit</span><span class="value">${lockedText}</span></div>
                 </div>
                 <div style="margin-top: 10px; font-size: 11px; color: var(--muted); background: rgba(0,0,0,0.3); padding: 5px; border-radius: 4px;">
-                    <strong>🤖 Co-Pilot Status:</strong> ${inTradeAiStatus}
+                    <strong>🤖 AI Manager:</strong> ${inTradeAiStatus}
                 </div>
             </div>`;
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Sniper AI Co-Pilot (GPT-4o)</title>
+            <!DOCTYPE html><html><head><title>Sniper AI Hybrid Co-Pilot</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="10">
             <style>
                 :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; --yellow: #eab308; }
@@ -543,7 +504,7 @@ app.get('/', async (req, res) => {
             </style></head>
             <body><div class="container">
                 <div class="header-flex">
-                    <h2 style="color:var(--purple); margin:0;">SNIPER AI (GPT-4o)</h2>
+                    <h2 style="color:var(--purple); margin:0;">SNIPER HYBRID AI (GPT+Gemini)</h2>
                     <span class="timestamp">Refresh: ${new Date().toLocaleTimeString()}</span>
                 </div>
 
@@ -569,15 +530,15 @@ app.get('/', async (req, res) => {
                 </div>
                 
                 <div class="card">
-                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">AI Brain (GitHub Models)</h3>
+                    <h3 style="margin: 0; font-size: 14px; color:var(--muted);">Multi-AI Brain Dashboard</h3>
                     <div class="ai-box" style="border-color: var(--blue); background: rgba(59, 130, 246, 0.05);">
-                        <strong>EOD Master Strategy:</strong><br/><em>"${eodStrategyShift}"</em>
+                        <strong>[GPT-4o-mini] EOD Master Strategy:</strong><br/><em>"${eodStrategyShift}"</em>
                     </div>
                     <div class="ai-box" style="border-color: var(--green); background: rgba(16,185,129,0.05);">
-                        <strong>MTF Confluence:</strong><br/><em>"${aiMacroRegime}"</em>
+                        <strong>[Gemini] MTF Confluence:</strong><br/><em>"${aiMacroRegime}"</em>
                     </div>
                     <div class="ai-box" style="border-color: var(--yellow); background: rgba(234, 179, 8, 0.05);">
-                        <strong>AI Post-Trade Lessons:</strong><br/>
+                        <strong>[Gemini] Post-Trade Lessons:</strong><br/>
                         <ul style="margin: 5px 0; padding-left: 20px;">${aiRecentLessons.map(l => `<li><em>${l}</em></li>`).join('')}</ul>
                     </div>
                 </div>
@@ -611,12 +572,12 @@ async function start() {
         
         await analyzeMarketState(); 
         setTimeout(async () => { await evolve(); }, 3000); 
-        await sendNotification(`AI Co-Pilot (GPT-4o) Online via Render.`);
+        await sendNotification(`🚀 Dual-AI Co-Pilot (GPT + Gemini) Online via Render.`);
         
         setInterval(tick, 5000); // 5 sec tick
-        setInterval(analyzeMarketState, 900000); // 15 mins (MTF & Risk)
-        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // 1 hr (Evolution)
-        setInterval(eodDebrief, 86400000); // 24 hrs (EOD Debrief)
+        setInterval(analyzeMarketState, 900000); // 15 mins (Gemini handles this easily)
+        setInterval(async () => { await evolve(); await pruneDatabase(); }, 3600000); // 1 hr 
+        setInterval(eodDebrief, 86400000); // 24 hrs (GPT handles this)
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e){} }, 30000);                          
         
     } catch (e) { console.error("Startup Error:", e); setTimeout(start, 10000); }
