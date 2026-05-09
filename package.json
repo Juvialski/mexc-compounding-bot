@@ -1,20 +1,20 @@
 {
-  "name": "sniper-v11-ai",
-  "version": "1.0.0",
-  "description": "AI-Enhanced Crypto Sniper Bot",
+  "name": "sniper-ai-copilot",
+  "version": "2.0.0",
+  "description": "Crypto scalping bot powered by MTF Confluence, MACD, and GitHub Models (GPT-4o)",
   "main": "index.js",
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@google/generative-ai": "latest",
-    "ccxt": "^4.3.0",
+    "ccxt": "^4.3.16",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "mongoose": "^8.4.0",
+    "mongoose": "^8.3.4",
+    "openai": "^4.40.0",
     "technicalindicators": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
