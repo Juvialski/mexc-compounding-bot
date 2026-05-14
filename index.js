@@ -69,7 +69,7 @@ let gridQty = 1;
 let gridNodes = []; 
 let lastLowerNodeIdx = -1;
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
-const ACTIVE_WINDOW = 3; // Places 3 Buys below price, 3 Sells above price
+const ACTIVE_WINDOW = 3; 
 
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
@@ -196,7 +196,6 @@ async function reconcileGrid() {
         const ticker = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(ticker.last);
 
-        // 1. OOB Emergency Recalibration
         if (currentPrice < gridMin - (gridSpacing*2) || currentPrice > gridMax + (gridSpacing*2)) {
             console.log("Price out of bounds! Recalibrating...");
             await sendNotification(`🚨 Out of Bounds ($${currentPrice.toFixed(2)}). Recalibrating Grid...`);
@@ -206,15 +205,15 @@ async function reconcileGrid() {
             return;
         }
 
-        // 2. STABLE STATE TRACKING: Find the highest node below current price
+        // 1. Find the highest node below current price
         let currentLowerNodeIdx = -1;
         for (let i = 0; i < gridNodes.length; i++) {
             if (gridNodes[i].price < currentPrice) {
                 currentLowerNodeIdx = i; 
-            } else { break; } // Array is ascending, so we can stop once price exceeds currentPrice
+            } else { break; } 
         }
 
-        // Detect Physical Line Crossing (Profit Capture)
+        // 2. Detect Line Crossing (Profit Capture)
         if (lastLowerNodeIdx !== -1 && currentLowerNodeIdx !== lastLowerNodeIdx) {
             const crossed = Math.abs(currentLowerNodeIdx - lastLowerNodeIdx);
             const profitPerNode = gridSpacing * gridQty * contractSize;
@@ -222,22 +221,20 @@ async function reconcileGrid() {
             dailyPnL += realizedPnL;
             
             await Trade.create({ type: 'Grid Fill', price: currentPrice, pnlUsd: realizedPnL });
-            console.log(`Grid Line Crossed! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
+            console.log(`✅ Grid Line Crossed! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
         }
         lastLowerNodeIdx = currentLowerNodeIdx;
 
-        // 3. Define the Active Window
+        // 3. Define Active Window
         const activeIndices = [];
-        // Buys below price
         for(let i = currentLowerNodeIdx - ACTIVE_WINDOW + 1; i <= currentLowerNodeIdx; i++) {
-            if (i >= 0) activeIndices.push(i);
+            if (i >= 0) activeIndices.push(i); // Buys below
         }
-        // Sells above price
         for(let i = currentLowerNodeIdx + 1; i <= currentLowerNodeIdx + ACTIVE_WINDOW; i++) {
-            if (i < gridNodes.length) activeIndices.push(i);
+            if (i < gridNodes.length) activeIndices.push(i); // Sells above
         }
 
-        // 4. Fetch Book & Align Orders
+        // 4. Fetch Book & Align Orders (WITH DIAGNOSTICS)
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -250,53 +247,64 @@ async function reconcileGrid() {
                 if(d < mDiff) { mDiff = d; matchedIdx = i; }
             }
 
-            if (mDiff > (gridSpacing * 0.45)) {
+            if (mDiff > (gridSpacing * 0.2)) {
                 matchedIdx = -1;
             }
 
             if (matchedIdx !== -1) {
                 const expectedSide = matchedIdx <= currentLowerNodeIdx ? 'buy' : 'sell';
-                const isSideMatch = o.side && o.side.toLowerCase() === expectedSide;
-                const oAmt = Number(o.amount || o.info?.vol || 0);
+                const actualSide = o.side ? o.side.toLowerCase() : expectedSide; // Fallback to expected if exchange data missing
+                const isSideMatch = (actualSide === expectedSide);
+                
+                // Extremely forgiving amount check to prevent CCXT data quirks from triggering cancels
+                const oAmt = Number(o.amount || o.contracts || o.info?.vol || o.info?.v || o.info?.amount || gridQty);
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
-                // Cancel if: not in active window, wrong side, wrong amount, OR IT'S A DUPLICATE
-                if (!activeIndices.includes(matchedIdx) || !isSideMatch || !isAmountMatch || ordersToKeep.includes(matchedIdx)) {
-                    try {
-                        console.log(`Canceling order at $${o.price}`);
-                        await mexc.cancelOrder(o.id, SYMBOL);
-                        await sleep(200); 
-                    } catch(e) { }
+                if (!activeIndices.includes(matchedIdx)) {
+                    console.log(`[CLEANUP] Canceling $${o.price}: Node shifted out of active window.`);
+                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
+                    await sleep(200); 
+                } else if (!isSideMatch) {
+                    console.log(`[CLEANUP] Canceling $${o.price}: Side mismatch. Expected ${expectedSide.toUpperCase()}`);
+                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
+                    await sleep(200); 
+                } else if (!isAmountMatch) {
+                    console.log(`[CLEANUP] Canceling $${o.price}: Amount mismatch. Expected ${gridQty}, found ${oAmt}`);
+                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
+                    await sleep(200); 
+                } else if (ordersToKeep.includes(matchedIdx)) {
+                    console.log(`[CLEANUP] Canceling $${o.price}: Duplicate order on same grid line.`);
+                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
+                    await sleep(200); 
                 } else {
+                    // This is a perfect order, leave it on the exchange book.
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
-                try {
-                    console.log(`Canceling stray order at $${o.price}`);
-                    await mexc.cancelOrder(o.id, SYMBOL);
-                    await sleep(200);
-                } catch(e) {}
+                console.log(`[CLEANUP] Canceling stray order at $${o.price}`);
+                await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
+                await sleep(200);
             }
         }
 
         // 5. Place Missing Orders
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
-                // Buffer check: if price is within 10% of spacing, wait so we don't trigger taker fees
+                // Buffer check: if price is resting right on the order line, wait so we don't trigger taker fees
                 const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
                 if (distanceToPrice < (gridSpacing * 0.10)) {
-                    console.log(`Price is hovering directly on node $${gridNodes[i].price}. Delaying placement to protect maker fees.`);
+                    console.log(`[PAUSE] Price is hovering right on node $${gridNodes[i].price}. Delaying placement to protect maker fees.`);
                     continue;
                 }
 
                 const desiredSide = i <= currentLowerNodeIdx ? 'buy' : 'sell';
                 try {
                     await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
-                    console.log(`Placed ${desiredSide} at $${gridNodes[i].price}`);
+                    console.log(`[PLACED] ${desiredSide.toUpperCase()} at $${gridNodes[i].price}`);
                     await sleep(200); 
                 } catch(e) {
                     if (e.message.includes('balance') || e.message.includes('margin')) {
-                        console.error(`Margin low, skipping order placement for $${gridNodes[i].price}`);
+                        console.error(`[MARGIN LOW] Skipping order placement for $${gridNodes[i].price}`);
                         break; 
                     }
                 }
@@ -330,7 +338,6 @@ app.get('/', async (req, res) => {
             const isExpectedBuy = i <= lastLowerNodeIdx;
             const sideStr = isExpectedBuy ? 'BUY' : 'SELL';
             
-            // Check if it falls inside the active window logic
             const isActive = isExpectedBuy 
                 ? (i >= lastLowerNodeIdx - ACTIVE_WINDOW + 1 && i <= lastLowerNodeIdx)
                 : (i >= lastLowerNodeIdx + 1 && i <= lastLowerNodeIdx + ACTIVE_WINDOW);
@@ -338,17 +345,11 @@ app.get('/', async (req, res) => {
             const color = isActive ? (isExpectedBuy ? 'text-green' : 'text-red') : 'text-muted';
             const status = isActive ? 'ACTIVE' : 'SHADOW';
 
-            // Insert "You Are Here" gap marker
             if (i === lastLowerNodeIdx) {
                 visualNodes.push({ price: currentPrice, side: 'GAP', color: 'text-yellow', status: '<-- CURRENT PRICE' });
             }
 
-            visualNodes.push({
-                price: gridNodes[i].price,
-                side: sideStr,
-                color: color,
-                status: status
-            });
+            visualNodes.push({ price: gridNodes[i].price, side: sideStr, color: color, status: status });
         }
 
         res.send(`
