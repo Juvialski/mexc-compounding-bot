@@ -1,11 +1,10 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - TIGHT SCALPING FIX
+// DYNAMIC AI GRID EDITION - WEEKLY SWING ANCHOR
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
-const { ATR } = require('technicalindicators');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
@@ -83,7 +82,7 @@ async function sendNotification(message) {
 }
 
 // ==========================================
-// DATABASE SETUP (WITH PERSISTENT BALANCE STATE)
+// DATABASE SETUP
 // ==========================================
 let dbStatus = "Connecting...";
 mongoose.connect(process.env.MONGO_URI)
@@ -128,56 +127,53 @@ async function buildDynamicGrid() {
         const b = await mexc.fetchBalance(); 
         walletBalance = b.total['USDT'] || 0;
 
-        // FIXED: Using 1-HOUR candles to calculate tight, high-frequency scalping volatility
-        const ohlcv = await mexc.fetchOHLCV(SYMBOL, '1h', undefined, 48);
-        const closes = ohlcv.map(c => c[4]);
-        const highs = ohlcv.map(c => c[2]);
-        const lows = ohlcv.map(c => c[3]);
+        // FETCH EXACT 7-DAY HIGH AND LOW
+        const ohlcv7d = await mexc.fetchOHLCV(SYMBOL, '1d', undefined, 7);
+        const weekHigh = Math.max(...ohlcv7d.map(c => c[2]));
+        const weekLow = Math.min(...ohlcv7d.map(c => c[3]));
         
-        const atr1h = ATR.calculate({ period: 14, high: highs, low: lows, close: closes }).pop() || 300;
         const currentPriceObj = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(currentPriceObj.last);
 
         const prompt = `
-        You are an elite high-frequency scalping Grid Bot on MEXC for ${SYMBOL}.
-        CRITICAL: The user has a micro balance ($${walletBalance.toFixed(2)}). 
+        You are managing a Grid Bot on MEXC for ${SYMBOL}.
         Current Price: $${currentPrice}
-        1-Hour ATR (Short-term Volatility): $${atr1h}
+        7-Day High: $${weekHigh}
+        7-Day Low: $${weekLow}
 
-        The user demands a VERY TIGHT, realistic scalping grid to capture rapid micro-chops. DO NOT create a wide swing-trading grid.
+        The user requested: "Base the grid at least above the week high. Not too tight."
         
         Rules:
-        1. The grid spacing MUST be between $120 and $250. This is wide enough to beat the 0.08% exchange fee, but tight enough to hit constantly.
-        2. Set 'lower_bound' and 'upper_bound' so the grid wraps perfectly around the current price. 
-        3. 'grid_levels' MUST be between 20 and 35.
+        1. 'upper_bound' MUST be slightly above the 7-Day High ($${weekHigh}).
+        2. 'lower_bound' MUST be slightly below the 7-Day Low ($${weekLow}).
+        3. 'grid_levels' should be between 20 and 40 so that the spacing between levels is viable for generating profit against exchange fees.
 
-        Provide JSON ONLY: {"lower_bound": 78000, "upper_bound": 82000, "grid_levels": 25, "reasoning": "..."}
+        Provide JSON ONLY: {"lower_bound": 60000, "upper_bound": 70000, "grid_levels": 30, "reasoning": "..."}
         `;
 
         let aiDecision;
         try {
             aiDecision = await askAIWithRetry(prompt, 2, 5000);
         } catch (e) {
-            aiDecision = { lower_bound: currentPrice - 2000, upper_bound: currentPrice + 2000, grid_levels: 25, reasoning: "Fallback tight scalping grid applied." };
+            aiDecision = { lower_bound: weekLow * 0.99, upper_bound: weekHigh * 1.01, grid_levels: 30, reasoning: "Fallback weekly range applied." };
         }
 
-        // HARD OVERRIDE SANITY CHECK: If AI hallucinates and gives a massive spacing, squash it.
-        let rawSpacing = (aiDecision.upper_bound - aiDecision.lower_bound) / aiDecision.grid_levels;
-        if (rawSpacing > 300) {
-            console.log(`[SANITY CHECK] AI created a grid spacing of $${rawSpacing}. That is too wide. Squashing it.`);
-            aiDecision.lower_bound = currentPrice - 2250;
-            aiDecision.upper_bound = currentPrice + 2250;
-            aiDecision.grid_levels = 25; // Forces spacing to be exactly $180
-            aiDecision.reasoning = "AI grid was too wide. Enforced a hard limit of +/- $2250 with $180 spacing.";
-        }
+        let gMin = Number(aiDecision.lower_bound);
+        let gMax = Number(aiDecision.upper_bound);
+        let gLevels = Number(aiDecision.grid_levels);
+
+        // SANITY CHECK: Force it to obey the weekly high/low rule even if the AI hallucinates
+        if (gMax < weekHigh) gMax = weekHigh * 1.005;
+        if (gMin > weekLow) gMin = weekLow * 0.995;
+        if (gLevels < 15 || gLevels > 50) gLevels = 30;
 
         await mexc.cancelAllOrders(SYMBOL);
         await sleep(500);
         await closeAllPositions();
 
-        gridMin = Number(aiDecision.lower_bound);
-        gridMax = Number(aiDecision.upper_bound);
-        gridLevelsCount = Number(aiDecision.grid_levels);
+        gridMin = gMin;
+        gridMax = gMax;
+        gridLevelsCount = gLevels;
         aiMacroRegime = aiDecision.reasoning;
 
         gridSpacing = (gridMax - gridMin) / gridLevelsCount;
@@ -200,7 +196,7 @@ async function buildDynamicGrid() {
         gridActive = true;
         
         console.log(`[GRID BUILT] Bounds: ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
-        await sendNotification(`🤖 AI Nano Scalp Grid Deployed\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nSpacing: $${gridSpacing.toFixed(2)}\nReasoning: ${aiMacroRegime}`);
+        await sendNotification(`🤖 AI Nano Grid Deployed\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nSpacing: $${gridSpacing.toFixed(2)}\nReasoning: ${aiMacroRegime}`);
 
     } catch (e) {
         console.error("Grid Building Error:", e.message);
@@ -219,9 +215,8 @@ async function reconcileGrid() {
         const ticker = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(ticker.last);
 
-        // OOB check tightened to allow smooth recalibration without panicking too early
         if (currentPrice < gridMin - (gridSpacing*1.5) || currentPrice > gridMax + (gridSpacing*1.5)) {
-            console.log("Price cleanly broke out of bounds! Recalibrating...");
+            console.log("Price out of bounds! Recalibrating...");
             await sendNotification(`🚨 Out of Bounds ($${currentPrice.toFixed(2)}). Recalibrating Grid...`);
             gridActive = false;
             await buildDynamicGrid();
