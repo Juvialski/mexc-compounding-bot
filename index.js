@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - ROCK SOLID FINAL (NO SPAM)
+// DYNAMIC AI GRID EDITION - TIGHT SCALPING FIX
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -128,38 +128,47 @@ async function buildDynamicGrid() {
         const b = await mexc.fetchBalance(); 
         walletBalance = b.total['USDT'] || 0;
 
-        const ohlcv = await mexc.fetchOHLCV(SYMBOL, '1d', undefined, 30);
+        // FIXED: Using 1-HOUR candles to calculate tight, high-frequency scalping volatility
+        const ohlcv = await mexc.fetchOHLCV(SYMBOL, '1h', undefined, 48);
         const closes = ohlcv.map(c => c[4]);
         const highs = ohlcv.map(c => c[2]);
         const lows = ohlcv.map(c => c[3]);
         
-        const atr14 = ATR.calculate({ period: 14, high: highs, low: lows, close: closes }).pop() || 1500;
+        const atr1h = ATR.calculate({ period: 14, high: highs, low: lows, close: closes }).pop() || 300;
         const currentPriceObj = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(currentPriceObj.last);
 
         const prompt = `
-        You are managing a Grid Bot on MEXC for ${SYMBOL}.
-        CRITICAL: The user has an extremely low balance ($${walletBalance.toFixed(2)}). 
+        You are an elite high-frequency scalping Grid Bot on MEXC for ${SYMBOL}.
+        CRITICAL: The user has a micro balance ($${walletBalance.toFixed(2)}). 
         Current Price: $${currentPrice}
-        14-Day ATR: $${atr14}
+        1-Hour ATR (Short-term Volatility): $${atr1h}
 
-        Define a safe daily grid. Since balance is low, keep the grid relatively tight. 
-        Ensure spacing is wide enough to cover the 0.08% round trip exchange fees to remain profitable.
+        The user demands a VERY TIGHT, realistic scalping grid to capture rapid micro-chops. DO NOT create a wide swing-trading grid.
         
-        Provide:
-        - lower_bound: price for the bottom grid line
-        - upper_bound: price for the top grid line
-        - grid_levels: strictly between 15 and 30 levels.
-        - reasoning: 1 sentence strategy explanation.
+        Rules:
+        1. The grid spacing MUST be between $120 and $250. This is wide enough to beat the 0.08% exchange fee, but tight enough to hit constantly.
+        2. Set 'lower_bound' and 'upper_bound' so the grid wraps perfectly around the current price. 
+        3. 'grid_levels' MUST be between 20 and 35.
 
-        Use JSON ONLY: {"lower_bound": 60000, "upper_bound": 65000, "grid_levels": 20, "reasoning": "..."}
+        Provide JSON ONLY: {"lower_bound": 78000, "upper_bound": 82000, "grid_levels": 25, "reasoning": "..."}
         `;
 
         let aiDecision;
         try {
             aiDecision = await askAIWithRetry(prompt, 2, 5000);
         } catch (e) {
-            aiDecision = { lower_bound: currentPrice - atr14, upper_bound: currentPrice + atr14, grid_levels: 20, reasoning: "Fallback ATR bounds applied." };
+            aiDecision = { lower_bound: currentPrice - 2000, upper_bound: currentPrice + 2000, grid_levels: 25, reasoning: "Fallback tight scalping grid applied." };
+        }
+
+        // HARD OVERRIDE SANITY CHECK: If AI hallucinates and gives a massive spacing, squash it.
+        let rawSpacing = (aiDecision.upper_bound - aiDecision.lower_bound) / aiDecision.grid_levels;
+        if (rawSpacing > 300) {
+            console.log(`[SANITY CHECK] AI created a grid spacing of $${rawSpacing}. That is too wide. Squashing it.`);
+            aiDecision.lower_bound = currentPrice - 2250;
+            aiDecision.upper_bound = currentPrice + 2250;
+            aiDecision.grid_levels = 25; // Forces spacing to be exactly $180
+            aiDecision.reasoning = "AI grid was too wide. Enforced a hard limit of +/- $2250 with $180 spacing.";
         }
 
         await mexc.cancelAllOrders(SYMBOL);
@@ -191,7 +200,7 @@ async function buildDynamicGrid() {
         gridActive = true;
         
         console.log(`[GRID BUILT] Bounds: ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
-        await sendNotification(`🤖 AI Nano Grid Deployed\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nSpacing: $${gridSpacing.toFixed(2)}\nReasoning: ${aiMacroRegime}`);
+        await sendNotification(`🤖 AI Nano Scalp Grid Deployed\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nSpacing: $${gridSpacing.toFixed(2)}\nReasoning: ${aiMacroRegime}`);
 
     } catch (e) {
         console.error("Grid Building Error:", e.message);
@@ -210,8 +219,9 @@ async function reconcileGrid() {
         const ticker = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(ticker.last);
 
-        if (currentPrice < gridMin - (gridSpacing*2) || currentPrice > gridMax + (gridSpacing*2)) {
-            console.log("Price out of bounds! Recalibrating...");
+        // OOB check tightened to allow smooth recalibration without panicking too early
+        if (currentPrice < gridMin - (gridSpacing*1.5) || currentPrice > gridMax + (gridSpacing*1.5)) {
+            console.log("Price cleanly broke out of bounds! Recalibrating...");
             await sendNotification(`🚨 Out of Bounds ($${currentPrice.toFixed(2)}). Recalibrating Grid...`);
             gridActive = false;
             await buildDynamicGrid();
@@ -219,17 +229,13 @@ async function reconcileGrid() {
             return;
         }
 
-        // 1. DEAD ZONE SHIFTING
         while (currentGapIdx > 0 && currentPrice <= gridNodes[currentGapIdx - 1].price) {
             currentGapIdx--;
-            console.log(`📉 Price crossed DOWN. Grid shifted down.`);
         }
         while (currentGapIdx < gridNodes.length - 1 && currentPrice >= gridNodes[currentGapIdx + 1].price) {
             currentGapIdx++;
-            console.log(`📈 Price crossed UP. Grid shifted up.`);
         }
 
-        // 2. DEFINE ACTIVE WINDOW
         const activeIndices = [];
         for(let i = currentGapIdx - 1; i >= Math.max(0, currentGapIdx - ACTIVE_WINDOW); i--) {
             activeIndices.push(i);
@@ -238,7 +244,6 @@ async function reconcileGrid() {
             activeIndices.push(i);
         }
 
-        // 3. FETCH BOOK & ALIGN ORDERS (NO SPAM, PURE PRICE MATCHING)
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -256,33 +261,28 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
-                // If it's outside our active window, cancel it.
                 if (!activeIndices.includes(matchedIdx)) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } 
-                // If we already have an order for this exact grid line, cancel the duplicate.
                 else if (ordersToKeep.includes(matchedIdx)) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } 
-                // PERFECT MATCH. NO CHECKING AMOUNTS. NO CHECKING STRINGS. LEAVE IT ALONE.
                 else {
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
-                // Stray order nowhere near our grid lines.
                 await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                 await sleep(200);
             }
         }
 
-        // 4. PLACE MISSING ORDERS
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
                 const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
                 if (distanceToPrice < (gridSpacing * 0.05)) {
-                    continue; // Maker fee protection
+                    continue; 
                 }
 
                 const desiredSide = i < currentGapIdx ? 'buy' : 'sell';
