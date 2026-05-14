@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - NANO-ACCOUNT SAFE
+// DYNAMIC AI GRID EDITION - ROCK SOLID STATE
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -67,9 +67,9 @@ let gridLevelsCount = 0;
 let gridSpacing = 0;
 let gridQty = 1; 
 let gridNodes = []; 
-let lastGapIndex = -1;
+let lastLowerNodeIdx = -1;
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
-const ACTIVE_WINDOW = 3; 
+const ACTIVE_WINDOW = 3; // Places 3 Buys below price, 3 Sells above price
 
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
@@ -151,20 +151,13 @@ async function buildDynamicGrid() {
         try {
             aiDecision = await askAIWithRetry(prompt, 2, 5000);
         } catch (e) {
-            console.log("AI Failed, using fallback defaults.");
-            aiDecision = {
-                lower_bound: currentPrice - atr14,
-                upper_bound: currentPrice + atr14,
-                grid_levels: 20,
-                reasoning: "Fallback ATR bounds applied."
-            };
+            aiDecision = { lower_bound: currentPrice - atr14, upper_bound: currentPrice + atr14, grid_levels: 20, reasoning: "Fallback ATR bounds applied." };
         }
 
         await mexc.cancelAllOrders(SYMBOL);
         await sleep(500);
         await closeAllPositions();
 
-        // FIX: Force these values to be strict Math Numbers just in case the AI returns them as strings
         gridMin = Number(aiDecision.lower_bound);
         gridMax = Number(aiDecision.upper_bound);
         gridLevelsCount = Number(aiDecision.grid_levels);
@@ -180,7 +173,7 @@ async function buildDynamicGrid() {
         let idealQty = Math.floor((walletBalance * 0.5 * LEVERAGE / gridLevelsCount) / (currentPrice * contractSize));
         gridQty = Math.max(1, idealQty); 
 
-        lastGapIndex = -1; 
+        lastLowerNodeIdx = -1; 
         gridActive = true;
         
         console.log(`[GRID BUILT] Bounds: ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
@@ -213,30 +206,35 @@ async function reconcileGrid() {
             return;
         }
 
-        // 2. Find Current Gap (closest node)
-        let minDiff = Infinity;
-        let targetGapIndex = -1;
+        // 2. STABLE STATE TRACKING: Find the highest node below current price
+        let currentLowerNodeIdx = -1;
         for (let i = 0; i < gridNodes.length; i++) {
-            const diff = Math.abs(gridNodes[i].price - currentPrice);
-            if (diff < minDiff) { minDiff = diff; targetGapIndex = i; }
+            if (gridNodes[i].price < currentPrice) {
+                currentLowerNodeIdx = i; 
+            } else { break; } // Array is ascending, so we can stop once price exceeds currentPrice
         }
 
-        // Detect Profit Trigger
-        if (lastGapIndex !== -1 && targetGapIndex !== lastGapIndex) {
-            const crossed = Math.abs(targetGapIndex - lastGapIndex);
+        // Detect Physical Line Crossing (Profit Capture)
+        if (lastLowerNodeIdx !== -1 && currentLowerNodeIdx !== lastLowerNodeIdx) {
+            const crossed = Math.abs(currentLowerNodeIdx - lastLowerNodeIdx);
             const profitPerNode = gridSpacing * gridQty * contractSize;
             const realizedPnL = crossed * profitPerNode;
             dailyPnL += realizedPnL;
             
             await Trade.create({ type: 'Grid Fill', price: currentPrice, pnlUsd: realizedPnL });
-            console.log(`Profit Captured! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
+            console.log(`Grid Line Crossed! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
         }
-        lastGapIndex = targetGapIndex;
+        lastLowerNodeIdx = currentLowerNodeIdx;
 
         // 3. Define the Active Window
         const activeIndices = [];
-        for(let i = Math.max(0, targetGapIndex - ACTIVE_WINDOW); i <= Math.min(gridNodes.length - 1, targetGapIndex + ACTIVE_WINDOW); i++) {
-            if (i !== targetGapIndex) activeIndices.push(i);
+        // Buys below price
+        for(let i = currentLowerNodeIdx - ACTIVE_WINDOW + 1; i <= currentLowerNodeIdx; i++) {
+            if (i >= 0) activeIndices.push(i);
+        }
+        // Sells above price
+        for(let i = currentLowerNodeIdx + 1; i <= currentLowerNodeIdx + ACTIVE_WINDOW; i++) {
+            if (i < gridNodes.length) activeIndices.push(i);
         }
 
         // 4. Fetch Book & Align Orders
@@ -257,15 +255,15 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
-                const expectedSide = matchedIdx < targetGapIndex ? 'buy' : 'sell';
+                const expectedSide = matchedIdx <= currentLowerNodeIdx ? 'buy' : 'sell';
                 const isSideMatch = o.side && o.side.toLowerCase() === expectedSide;
-                
                 const oAmt = Number(o.amount || o.info?.vol || 0);
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
-                if (!activeIndices.includes(matchedIdx) || !isSideMatch || !isAmountMatch) {
+                // Cancel if: not in active window, wrong side, wrong amount, OR IT'S A DUPLICATE
+                if (!activeIndices.includes(matchedIdx) || !isSideMatch || !isAmountMatch || ordersToKeep.includes(matchedIdx)) {
                     try {
-                        console.log(`Canceling order at $${o.price} - Shifting grid or cleaning mismatches.`);
+                        console.log(`Canceling order at $${o.price}`);
                         await mexc.cancelOrder(o.id, SYMBOL);
                         await sleep(200); 
                     } catch(e) { }
@@ -284,7 +282,14 @@ async function reconcileGrid() {
         // 5. Place Missing Orders
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
-                const desiredSide = i < targetGapIndex ? 'buy' : 'sell';
+                // Buffer check: if price is within 10% of spacing, wait so we don't trigger taker fees
+                const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
+                if (distanceToPrice < (gridSpacing * 0.10)) {
+                    console.log(`Price is hovering directly on node $${gridNodes[i].price}. Delaying placement to protect maker fees.`);
+                    continue;
+                }
+
+                const desiredSide = i <= currentLowerNodeIdx ? 'buy' : 'sell';
                 try {
                     await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
                     console.log(`Placed ${desiredSide} at $${gridNodes[i].price}`);
@@ -317,17 +322,32 @@ app.get('/', async (req, res) => {
         const allTrades = await Trade.find().sort({ time: -1 }).limit(10).lean();
         const totalPnl = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
 
-        let startIdx = Math.max(0, lastGapIndex - ACTIVE_WINDOW - 1);
-        let endIdx = Math.min(gridNodes.length - 1, lastGapIndex + ACTIVE_WINDOW + 1);
+        let startIdx = Math.max(0, lastLowerNodeIdx - ACTIVE_WINDOW - 1);
+        let endIdx = Math.min(gridNodes.length - 1, lastLowerNodeIdx + ACTIVE_WINDOW + 2);
         let visualNodes = [];
         
         for(let i = endIdx; i >= startIdx; i--) { 
-            const isActive = i >= lastGapIndex - ACTIVE_WINDOW && i <= lastGapIndex + ACTIVE_WINDOW && i !== lastGapIndex;
+            const isExpectedBuy = i <= lastLowerNodeIdx;
+            const sideStr = isExpectedBuy ? 'BUY' : 'SELL';
+            
+            // Check if it falls inside the active window logic
+            const isActive = isExpectedBuy 
+                ? (i >= lastLowerNodeIdx - ACTIVE_WINDOW + 1 && i <= lastLowerNodeIdx)
+                : (i >= lastLowerNodeIdx + 1 && i <= lastLowerNodeIdx + ACTIVE_WINDOW);
+                
+            const color = isActive ? (isExpectedBuy ? 'text-green' : 'text-red') : 'text-muted';
+            const status = isActive ? 'ACTIVE' : 'SHADOW';
+
+            // Insert "You Are Here" gap marker
+            if (i === lastLowerNodeIdx) {
+                visualNodes.push({ price: currentPrice, side: 'GAP', color: 'text-yellow', status: '<-- CURRENT PRICE' });
+            }
+
             visualNodes.push({
                 price: gridNodes[i].price,
-                side: i < lastGapIndex ? 'BUY' : i > lastGapIndex ? 'SELL' : 'GAP (Current)',
-                color: i === lastGapIndex ? 'text-yellow' : isActive ? (i < lastGapIndex ? 'text-green' : 'text-red') : 'text-muted',
-                status: isActive ? 'ACTIVE' : (i === lastGapIndex ? '<-- YOU ARE HERE' : 'SHADOW (Inactive)')
+                side: sideStr,
+                color: color,
+                status: status
             });
         }
 
@@ -383,7 +403,7 @@ app.get('/', async (req, res) => {
                 <div class="card">
                     <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Shadow Grid Radar</h3>
                     <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px;">
-                        ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>$${n.price.toFixed(2)}</span><span class="${n.color}">${n.status}</span></div>`).join('')}
+                        ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>${n.side === 'GAP' ? '' : '$'}${n.price.toFixed(2)}</span><span class="${n.color}">${n.status}</span></div>`).join('')}
                     </div>
                     <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">To prevent margin exhaustion on account, bot only places orders marked ACTIVE. Shadow levels are held in AI memory.</div>
                 </div>
