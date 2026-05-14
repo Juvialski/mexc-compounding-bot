@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - ROCK SOLID STATE V3 (FEE ACCURATE)
+// DYNAMIC AI GRID EDITION - EXACT WALLET PNL TRACKING
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -46,7 +46,6 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
 // ==========================================
 const SYMBOL = 'BTC/USDT:USDT';
 const LEVERAGE = 10;
-const FEE_RATE = 0.0004; // 0.04% fee per order based on MEXC history
 
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
@@ -58,7 +57,6 @@ const mexc = new ccxt.mexc({
 let walletBalance = 0;
 let currentPrice = 0;
 let contractSize = 0.0001; 
-let dailyPnL = 0;
 
 // AI Grid State
 let isReconciling = false;
@@ -85,7 +83,7 @@ async function sendNotification(message) {
 }
 
 // ==========================================
-// DATABASE SETUP
+// DATABASE SETUP (WITH PERSISTENT BALANCE STATE)
 // ==========================================
 let dbStatus = "Connecting...";
 mongoose.connect(process.env.MONGO_URI)
@@ -94,6 +92,13 @@ mongoose.connect(process.env.MONGO_URI)
 
 const Trade = mongoose.model('Trade', new mongoose.Schema({
     type: String, price: Number, pnlUsd: Number, time: { type: Date, default: Date.now }
+}));
+
+const BotState = mongoose.model('BotState', new mongoose.Schema({
+    key: { type: String, default: 'main' },
+    initialBalance: Number,
+    dailyStartBalance: Number,
+    lastReset: Date
 }));
 
 // ==========================================
@@ -137,10 +142,9 @@ async function buildDynamicGrid() {
         CRITICAL: The user has an extremely low balance ($${walletBalance.toFixed(2)}). 
         Current Price: $${currentPrice}
         14-Day ATR: $${atr14}
-        Exchange Fees: The user pays a 0.08% round-trip fee on every grid trade.
 
         Define a safe daily grid. Since balance is low, keep the grid relatively tight. 
-        HOWEVER, you MUST ensure that the grid spacing is wide enough so that the gross profit per level comfortably outpaces the 0.08% round trip fee.
+        Ensure spacing is wide enough to cover the 0.08% round trip exchange fees to remain profitable.
         
         Provide:
         - lower_bound: price for the bottom grid line
@@ -209,7 +213,6 @@ async function reconcileGrid() {
             return;
         }
 
-        // 1. Find highest node below current price
         let currentLowerNodeIdx = -1;
         for (let i = 0; i < gridNodes.length; i++) {
             if (gridNodes[i].price < currentPrice) {
@@ -217,25 +220,9 @@ async function reconcileGrid() {
             } else { break; } 
         }
 
-        // 2. Detect Line Crossing (ACCURATE NET PROFIT CAPTURE)
-        if (lastLowerNodeIdx !== -1 && currentLowerNodeIdx !== lastLowerNodeIdx) {
-            const crossed = Math.abs(currentLowerNodeIdx - lastLowerNodeIdx);
-            
-            const grossProfitPerNode = gridSpacing * gridQty * contractSize;
-            const positionValueUsd = currentPrice * gridQty * contractSize;
-            const roundTripFee = positionValueUsd * FEE_RATE * 2; // Buy Fee + Sell Fee
-            
-            const netProfitPerNode = grossProfitPerNode - roundTripFee;
-            const realizedPnL = crossed * netProfitPerNode;
-            
-            dailyPnL += realizedPnL;
-            
-            await Trade.create({ type: 'Grid Fill', price: currentPrice, pnlUsd: realizedPnL });
-            console.log(`✅ Grid Line Crossed! Shifted ${crossed} node(s). Gross: $${(crossed*grossProfitPerNode).toFixed(4)} | Fees: -$${(crossed*roundTripFee).toFixed(4)} | Net: $${realizedPnL.toFixed(4)}`);
-        }
+        // PnL Calculation removed from here! Handled purely by the Wallet Tracking interval now.
         lastLowerNodeIdx = currentLowerNodeIdx;
 
-        // 3. Define Active Window
         const activeIndices = [];
         for(let i = currentLowerNodeIdx - ACTIVE_WINDOW + 1; i <= currentLowerNodeIdx; i++) {
             if (i >= 0) activeIndices.push(i); 
@@ -244,7 +231,6 @@ async function reconcileGrid() {
             if (i < gridNodes.length) activeIndices.push(i); 
         }
 
-        // 4. Fetch Book & Align Orders
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -266,47 +252,35 @@ async function reconcileGrid() {
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
                 if (!activeIndices.includes(matchedIdx)) {
-                    console.log(`[CLEANUP] Canceling $${o.price}: Node shifted out of active window.`);
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else if (!isAmountMatch) {
-                    console.log(`[CLEANUP] Canceling $${o.price}: Amount mismatch. Expected ${gridQty}, found ${oAmt}`);
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else if (ordersToKeep.includes(matchedIdx)) {
-                    console.log(`[CLEANUP] Canceling $${o.price}: Duplicate order on same grid line.`);
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else {
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
-                console.log(`[CLEANUP] Canceling stray order at $${o.price}`);
                 await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                 await sleep(200);
             }
         }
 
-        // 5. Place Missing Orders
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
                 const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
                 if (distanceToPrice < (gridSpacing * 0.10)) {
-                    console.log(`[PAUSE] Price is hovering right on node $${gridNodes[i].price}. Delaying placement to protect maker fees.`);
                     continue;
                 }
 
                 const desiredSide = i <= currentLowerNodeIdx ? 'buy' : 'sell';
                 try {
                     await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
-                    console.log(`[PLACED] ${desiredSide.toUpperCase()} at $${gridNodes[i].price}`);
                     await sleep(200); 
-                } catch(e) {
-                    if (e.message.includes('balance') || e.message.includes('margin')) {
-                        console.error(`[MARGIN LOW] Skipping order placement for $${gridNodes[i].price}`);
-                        break; 
-                    }
-                }
+                } catch(e) { break; }
             }
         }
 
@@ -320,14 +294,33 @@ async function reconcileGrid() {
 // ==========================================
 // ROUTES & DASHBOARD UI
 // ==========================================
-app.get('/reset-db', async (req, res) => { try { await Trade.deleteMany({}); dailyPnL = 0; res.send(`<h2>DB Cleared. All PnL reset to $0.</h2>`); } catch(e){ res.send(e.message); } });
+app.get('/reset-db', async (req, res) => { 
+    try { 
+        await Trade.deleteMany({}); 
+        await BotState.deleteMany({});
+        
+        const b = await mexc.fetchBalance(); 
+        walletBalance = b.total['USDT'] || 0;
+        await BotState.create({ key: 'main', initialBalance: walletBalance, dailyStartBalance: walletBalance, lastReset: new Date() });
+        
+        res.send(`<h2>Database Cleared. Baseline Wallet Balance set to exactly $${walletBalance.toFixed(4)}.</h2>`); 
+    } catch(e){ res.send(e.message); } 
+});
+
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
     if (dbStatus !== "Connected" || gridNodes.length === 0) return res.send(`<h2>AI Grid Initializing... (Fetching AI Data)</h2>`);
     try {
-        const allTrades = await Trade.find().sort({ time: -1 }).limit(10).lean();
-        const totalPnl = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
+        const allTrades = await Trade.find().sort({ time: -1 }).limit(12).lean();
+        const state = await BotState.findOne({ key: 'main' });
+        
+        let allTimePnL = 0;
+        let dailyPnL = 0;
+        if (state) {
+            allTimePnL = walletBalance - state.initialBalance;
+            dailyPnL = walletBalance - state.dailyStartBalance;
+        }
 
         let startIdx = Math.max(0, lastLowerNodeIdx - ACTIVE_WINDOW - 1);
         let endIdx = Math.min(gridNodes.length - 1, lastLowerNodeIdx + ACTIVE_WINDOW + 2);
@@ -379,9 +372,9 @@ app.get('/', async (req, res) => {
 
                 <div class="grid" style="margin-bottom: 15px;">
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">BTC/USDT</div><div class="stat-value text-blue">$${currentPrice.toFixed(2)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Actual Wallet Balance</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(4)}</div></div>
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">Daily Session Net PnL</div><div class="stat-value ${dailyPnL >= 0 ? 'text-green' : 'text-red'}">$${dailyPnL.toFixed(4)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time Net PnL</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(4)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time Net PnL</div><div class="stat-value ${allTimePnL >= 0 ? 'text-green' : 'text-red'}">$${allTimePnL.toFixed(4)}</div></div>
                 </div>
 
                 <div class="card">
@@ -405,18 +398,17 @@ app.get('/', async (req, res) => {
                     <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px;">
                         ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>${n.side === 'GAP' ? '' : '$'}${n.price.toFixed(2)}</span><span class="${n.color}">${n.status}</span></div>`).join('')}
                     </div>
-                    <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">To prevent margin exhaustion on account, bot only places orders marked ACTIVE. Shadow levels are held in AI memory.</div>
                 </div>
 
                 <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Recent True Net PnL Fills</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Realized Wallet Settlements (Exact USDT Difference)</h3>
                     <div style="overflow-x:auto;">
-                        <table><tr><th>Time</th><th>Event</th><th>Price Crossed</th><th>Net PnL (After Fees)</th></tr>
+                        <table><tr><th>Time</th><th>Event</th><th>Price</th><th>Exact USDT Change</th></tr>
                         ${allTrades.map(t => `<tr>
                                 <td>${formatPHT(t.time)}</td>
                                 <td><span style="background:var(--blue); color:#fff; padding:2px 6px; border-radius:4px; font-size:10px;">${t.type}</span></td>
                                 <td>$${(t.price||0).toFixed(2)}</td>
-                                <td class="text-green">+$${(t.pnlUsd||0).toFixed(4)}</td>
+                                <td class="${(t.pnlUsd||0) >= 0 ? 'text-green' : 'text-red'}">${(t.pnlUsd||0) > 0 ? '+' : ''}$${(t.pnlUsd||0).toFixed(4)}</td>
                             </tr>`).join('')}
                         </table>
                     </div>
@@ -426,25 +418,54 @@ app.get('/', async (req, res) => {
 });
 
 // ==========================================
-// STARTUP SCHEDULER
+// STARTUP SCHEDULER & TRUE BALANCE TRACKER
 // ==========================================
 async function start() {
     try {
         const markets = await mexc.loadMarkets();
         contractSize = markets[SYMBOL].contractSize || 0.0001;
+        
         const b = await mexc.fetchBalance(); 
         walletBalance = b.total['USDT'] || 0;
+
+        let state = await BotState.findOne({ key: 'main' });
+        if (!state) {
+            await BotState.create({ key: 'main', initialBalance: walletBalance, dailyStartBalance: walletBalance, lastReset: new Date() });
+        }
         
-        await sendNotification(`🚀 Nano Grid AI Online. Safeguards active.`);
+        await sendNotification(`🚀 Nano Grid AI Online. True Balance Tracking Active.`);
         
         await buildDynamicGrid(); 
         
+        // 1. Core Order Management
         setInterval(reconcileGrid, 15000); 
         
-        setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e){} }, 60000);                          
+        // 2. EXACT Wallet Balance Tracker (Checks every 30 seconds for physical USDT changes)
+        setInterval(async () => { 
+            try { 
+                const bal = await mexc.fetchBalance(); 
+                const newBal = bal.total['USDT'] || 0; 
+                
+                if (newBal > 0) {
+                    const diff = newBal - walletBalance;
+                    // If balance changed by more than $0.0001 (filters out micro dust)
+                    if (Math.abs(diff) > 0.0001) {
+                        await Trade.create({ 
+                            type: 'Wallet Settlement', 
+                            price: currentPrice, 
+                            pnlUsd: diff 
+                        });
+                        console.log(`[BALANCE UPDATE] Wallet changed by $${diff.toFixed(4)}. New Balance: $${newBal.toFixed(4)}`);
+                    }
+                    walletBalance = newBal;
+                }
+            } catch(e){} 
+        }, 30000);                          
         
+        // 3. Daily AI Recalibration
         setInterval(async () => {
-            dailyPnL = 0; 
+            const currentBal = await mexc.fetchBalance().then(b => b.total['USDT'] || walletBalance);
+            await BotState.updateOne({ key: 'main' }, { $set: { dailyStartBalance: currentBal, lastReset: new Date() } });
             await buildDynamicGrid();
         }, 86400000); 
         
