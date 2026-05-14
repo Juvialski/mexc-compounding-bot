@@ -1,11 +1,11 @@
 // ==========================================
-// Paste May 2026 - DYNAMIC AI GRID EDITION
+// DYNAMIC AI GRID EDITION - NANO-ACCOUNT SAFE
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
 const express = require('express');
 const mongoose = require('mongoose');
-const { ATR, SMA } = require('technicalindicators');
+const { ATR } = require('technicalindicators');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
@@ -20,6 +20,8 @@ const aiModel = genAI.getGenerativeModel({
     generationConfig: { responseMimeType: "application/json" }
 });
 
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -30,9 +32,8 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
             return JSON.parse(responseText);
         } catch (error) {
             if (attempt < maxRetries) {
-                const delay = baseDelayMs * attempt; 
-                console.warn(`[AI Error] Retrying attempt ${attempt + 1} in ${delay / 1000}s...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+                console.warn(`[AI Error] Retrying attempt ${attempt + 1}...`);
+                await sleep(baseDelayMs * attempt);
             } else {
                 throw error; 
             }
@@ -64,11 +65,11 @@ let gridMin = 0;
 let gridMax = 0;
 let gridLevelsCount = 0;
 let gridSpacing = 0;
-let gridQty = 0;
-let gridNodes = []; // Array of { price }
+let gridQty = 1; // Defaulting to 1 for nano accounts
+let gridNodes = []; 
 let lastGapIndex = -1;
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
-let currentRiskPercent = 20;
+const ACTIVE_WINDOW = 3; // ONLY PLACE 3 ORDERS ABOVE AND 3 BELOW (Anti-Margin Exhaustion)
 
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
@@ -78,7 +79,7 @@ const formatPHT = (dateInput) => {
 async function sendNotification(message) {
     const webhookUrl = process.env.WEBHOOK_URL; 
     if (!webhookUrl) return; 
-    try { await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `Grid AI Co-Pilot\n${message}` }) }); } catch (e) { }
+    try { await fetch(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: `Nano Grid AI\n${message}` }) }); } catch (e) { }
 }
 
 // ==========================================
@@ -105,6 +106,7 @@ async function closeAllPositions() {
             const contracts = Number(pos.contracts || pos.info?.position || 0);
             await mexc.createMarketOrder(SYMBOL, side, contracts, undefined, { 'reduceOnly': true });
             console.log(`Closed existing ${pos.side} position of ${contracts} contracts to reset Grid.`);
+            await sleep(500); // Rate limit protection
         }
     } catch(e) { console.error("Error closing positions:", e.message); }
 }
@@ -114,9 +116,11 @@ async function closeAllPositions() {
 // ==========================================
 async function buildDynamicGrid() {
     console.log("Initiating AI Grid Re-calculation...");
-    gridActive = false; // Pause reconciliation
+    gridActive = false;
     try {
-        // 1. Fetch MTF Data for AI
+        const b = await mexc.fetchBalance(); 
+        walletBalance = b.total['USDT'] || 0;
+
         const ohlcv = await mexc.fetchOHLCV(SYMBOL, '1d', undefined, 30);
         const closes = ohlcv.map(c => c[4]);
         const highs = ohlcv.map(c => c[2]);
@@ -126,50 +130,43 @@ async function buildDynamicGrid() {
         const currentPriceObj = await mexc.fetchTicker(SYMBOL);
         currentPrice = Number(currentPriceObj.last);
 
-        // 2. Prompt Gemini for Grid Bounds
         const prompt = `
-        You are an elite quantitative trading AI managing a Grid Trading Bot on MEXC for ${SYMBOL}.
+        You are managing a Grid Bot on MEXC for ${SYMBOL}.
+        CRITICAL: The user has an extremely low balance ($${walletBalance.toFixed(2)}). 
         Current Price: $${currentPrice}
-        14-Day ATR (Volatility): $${atr14}
+        14-Day ATR: $${atr14}
 
-        Define a daily grid trading strategy. 
-        - The bounds should contain the expected 24h price action based on ATR. 
-        - If the asset is highly volatile, widen the bounds.
-        - Give a safe 'risk_percent' (10 to 40) of the account to allocate.
+        Define a safe daily grid. Since balance is low, keep the grid relatively tight around the current price so the bot can capture smaller chops without requiring massive margin to span a huge range.
         
         Provide:
         - lower_bound: price for the bottom grid line
         - upper_bound: price for the top grid line
-        - grid_levels: number of grid lines (between 15 and 40)
-        - risk_percent: % of account risk
-        - reasoning: 1 sentence explanation of why you chose these bounds.
+        - grid_levels: strictly between 15 and 30 levels.
+        - reasoning: 1 sentence strategy explanation.
 
-        Use JSON format ONLY: {"lower_bound": 60000, "upper_bound": 65000, "grid_levels": 20, "risk_percent": 25, "reasoning": "..."}
+        Use JSON ONLY: {"lower_bound": 60000, "upper_bound": 65000, "grid_levels": 20, "reasoning": "..."}
         `;
 
         let aiDecision;
         try {
             aiDecision = await askAIWithRetry(prompt, 2, 5000);
         } catch (e) {
-            console.log("AI Failed, falling back to safe mathematical defaults.");
+            console.log("AI Failed, using fallback defaults.");
             aiDecision = {
-                lower_bound: currentPrice - (atr14 * 1.5),
-                upper_bound: currentPrice + (atr14 * 1.5),
-                grid_levels: 25,
-                risk_percent: 20,
-                reasoning: "Fallback mathematical ATR bounds due to AI timeout."
+                lower_bound: currentPrice - atr14,
+                upper_bound: currentPrice + atr14,
+                grid_levels: 20,
+                reasoning: "Fallback ATR bounds applied."
             };
         }
 
-        // 3. Clear slate and realize any out-of-bounds exposure
         await mexc.cancelAllOrders(SYMBOL);
+        await sleep(500);
         await closeAllPositions();
 
-        // 4. Update State
         gridMin = aiDecision.lower_bound;
         gridMax = aiDecision.upper_bound;
         gridLevelsCount = aiDecision.grid_levels;
-        currentRiskPercent = aiDecision.risk_percent;
         aiMacroRegime = aiDecision.reasoning;
 
         gridSpacing = (gridMax - gridMin) / gridLevelsCount;
@@ -178,25 +175,24 @@ async function buildDynamicGrid() {
             gridNodes.push({ price: parseFloat((gridMin + (i * gridSpacing)).toFixed(2)) });
         }
 
-        // Calculate quantity per node
-        let allocUsd = walletBalance * (currentRiskPercent / 100) * LEVERAGE;
-        gridQty = Math.floor((allocUsd / gridLevelsCount) / (currentPrice * contractSize));
-        if (gridQty < 1) gridQty = 1; // Enforce minimum 1 contract
+        // Lock Qty to minimum 1 for nano accounts, unless balance grows significantly
+        let idealQty = Math.floor((walletBalance * 0.5 * LEVERAGE / gridLevelsCount) / (currentPrice * contractSize));
+        gridQty = Math.max(1, idealQty); 
 
         lastGapIndex = -1; 
         gridActive = true;
         
-        console.log(`[GRID BUILT] ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
-        await sendNotification(`🤖 AI Deployed New Grid\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nLevels: ${gridLevelsCount}\nQty per node: ${gridQty} Contracts\nReasoning: ${aiMacroRegime}`);
+        console.log(`[GRID BUILT] Bounds: ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
+        await sendNotification(`🤖 AI Nano Grid Deployed\nBounds: $${gridMin.toFixed(2)} - $${gridMax.toFixed(2)}\nSpacing: $${gridSpacing.toFixed(2)}\nReasoning: ${aiMacroRegime}`);
 
     } catch (e) {
         console.error("Grid Building Error:", e.message);
-        setTimeout(buildDynamicGrid, 30000); // Retry in 30s
+        setTimeout(buildDynamicGrid, 30000);
     }
 }
 
 // ==========================================
-// STATELESS GRID RECONCILIATION LOOP
+// SHADOW GRID RECONCILIATION LOOP
 // ==========================================
 async function reconcileGrid() {
     if (isReconciling || !gridActive) return;
@@ -208,26 +204,23 @@ async function reconcileGrid() {
 
         // 1. OOB Emergency Recalibration
         if (currentPrice < gridMin - (gridSpacing*2) || currentPrice > gridMax + (gridSpacing*2)) {
-            console.log("Price broke out of grid bounds! Triggering Emergency AI Recalibration...");
-            await sendNotification(`🚨 Price Out of Bounds ($${currentPrice}). Suspending and Recalibrating Grid...`);
+            console.log("Price out of bounds! Recalibrating...");
+            await sendNotification(`🚨 Out of Bounds ($${currentPrice.toFixed(2)}). Recalibrating Grid...`);
             gridActive = false;
             await buildDynamicGrid();
             isReconciling = false;
             return;
         }
 
-        // 2. Find the GAP (closest grid node to current price)
+        // 2. Find Current Gap (closest node)
         let minDiff = Infinity;
         let targetGapIndex = -1;
         for (let i = 0; i < gridNodes.length; i++) {
             const diff = Math.abs(gridNodes[i].price - currentPrice);
-            if (diff < minDiff) {
-                minDiff = diff;
-                targetGapIndex = i;
-            }
+            if (diff < minDiff) { minDiff = diff; targetGapIndex = i; }
         }
 
-        // Detect if Gap moved (a Grid Fill occurred)
+        // Detect Profit Trigger
         if (lastGapIndex !== -1 && targetGapIndex !== lastGapIndex) {
             const crossed = Math.abs(targetGapIndex - lastGapIndex);
             const profitPerNode = gridSpacing * gridQty * contractSize;
@@ -235,44 +228,53 @@ async function reconcileGrid() {
             dailyPnL += realizedPnL;
             
             await Trade.create({ type: 'Grid Fill', price: currentPrice, pnlUsd: realizedPnL });
-            console.log(`Grid Fill! Shifted ${crossed} node(s). Approx Profit: $${realizedPnL.toFixed(2)}`);
+            console.log(`Profit Captured! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
         }
         lastGapIndex = targetGapIndex;
 
-        // 3. Fetch Book & Align Orders
-        const openOrders = await mexc.fetchOpenOrders(SYMBOL);
-        const openOrderMap = {}; 
-        
-        // Map open orders to nearest node indices
-        for (let o of openOrders) {
-            let mDiff = Infinity; let mIdx = -1;
-            for(let i=0; i<gridNodes.length; i++){
-                if(Math.abs(gridNodes[i].price - o.price) < mDiff) { mDiff = Math.abs(gridNodes[i].price - o.price); mIdx = i; }
-            }
-            if(mDiff < gridSpacing * 0.2) openOrderMap[mIdx] = o;
+        // 3. Define the Active Window (Shadow Grid Optimization)
+        const activeIndices = [];
+        for(let i = Math.max(0, targetGapIndex - ACTIVE_WINDOW); i <= Math.min(gridNodes.length - 1, targetGapIndex + ACTIVE_WINDOW); i++) {
+            if (i !== targetGapIndex) activeIndices.push(i);
         }
 
-        // 4. Stateless Healing
-        // For every node: If index < gap -> BUY. If index > gap -> SELL. If index == gap -> NO ORDER.
-        for (let i = 0; i < gridNodes.length; i++) {
-            let desiredSide = null;
-            if (i < targetGapIndex) desiredSide = 'buy';
-            else if (i > targetGapIndex) desiredSide = 'sell';
+        // 4. Fetch Book & Align Orders with Anti-Spam Delays
+        const openOrders = await mexc.fetchOpenOrders(SYMBOL);
+        const ordersToKeep = [];
 
-            let existingOrder = openOrderMap[i];
+        for (let o of openOrders) {
+            let matchedIdx = -1;
+            let mDiff = Infinity;
+            for(let i = 0; i < gridNodes.length; i++){
+                const d = Math.abs(gridNodes[i].price - o.price);
+                if(d < mDiff && d < (gridSpacing * 0.2)) { mDiff = d; matchedIdx = i; }
+            }
 
-            if (desiredSide === null) {
-                // Gap node shouldn't have an order
-                if (existingOrder) await mexc.cancelOrder(existingOrder.id, SYMBOL).catch(()=>{});
+            const expectedSide = matchedIdx < targetGapIndex ? 'buy' : 'sell';
+
+            // Cancel if out of active window, wrong side, or wrong size
+            if (!activeIndices.includes(matchedIdx) || o.side !== expectedSide || o.amount !== gridQty) {
+                try {
+                    await mexc.cancelOrder(o.id, SYMBOL);
+                    await sleep(200); // 200ms ANTI-SPAM THROTTLE
+                } catch(e) { }
             } else {
-                if (existingOrder) {
-                    if (existingOrder.side !== desiredSide) {
-                        await mexc.cancelOrder(existingOrder.id, SYMBOL).catch(()=>{});
-                        await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price).catch(()=>{});
+                ordersToKeep.push(matchedIdx);
+            }
+        }
+
+        // 5. Place Missing Orders within Active Window
+        for (let i of activeIndices) {
+            if (!ordersToKeep.includes(i)) {
+                const desiredSide = i < targetGapIndex ? 'buy' : 'sell';
+                try {
+                    await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
+                    await sleep(200); // 200ms ANTI-SPAM THROTTLE
+                } catch(e) {
+                    if (e.message.includes('balance') || e.message.includes('margin')) {
+                        console.error("Margin low, pausing order placement momentarily.");
+                        break; 
                     }
-                } else {
-                    // Missing order (either it filled, or wasn't placed)
-                    await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price).catch(()=>{});
                 }
             }
         }
@@ -291,29 +293,29 @@ app.get('/reset-db', async (req, res) => { try { await Trade.deleteMany({}); res
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
-    if (dbStatus !== "Connected" || gridNodes.length === 0) return res.send(`<h2>AI Grid Initialization in progress... Please wait 60 seconds.</h2>`);
+    if (dbStatus !== "Connected" || gridNodes.length === 0) return res.send(`<h2>AI Grid Initializing... (Fetching AI Data)</h2>`);
     try {
-        const allTrades = await Trade.find().sort({ time: -1 }).limit(15).lean();
+        const allTrades = await Trade.find().sort({ time: -1 }).limit(10).lean();
         const totalPnl = (await Trade.find()).reduce((sum, t) => sum + (t.pnlUsd || 0), 0);
 
-        // Generate Grid Visualization array
-        // Show 4 nodes above gap, 4 below gap
-        let startIdx = Math.max(0, lastGapIndex - 5);
-        let endIdx = Math.min(gridNodes.length - 1, lastGapIndex + 5);
+        let startIdx = Math.max(0, lastGapIndex - ACTIVE_WINDOW - 1);
+        let endIdx = Math.min(gridNodes.length - 1, lastGapIndex + ACTIVE_WINDOW + 1);
         let visualNodes = [];
-        for(let i = endIdx; i >= startIdx; i--) { // Reverse order for visual (high price on top)
+        for(let i = endIdx; i >= startIdx; i--) { 
+            const isActive = i >= targetGapIndex - ACTIVE_WINDOW && i <= targetGapIndex + ACTIVE_WINDOW && i !== lastGapIndex;
             visualNodes.push({
                 price: gridNodes[i].price,
-                side: i < lastGapIndex ? 'BUY' : i > lastGapIndex ? 'SELL' : 'GAP (Current Price)',
-                color: i < lastGapIndex ? 'text-green' : i > lastGapIndex ? 'text-red' : 'text-yellow'
+                side: i < lastGapIndex ? 'BUY' : i > lastGapIndex ? 'SELL' : 'GAP (Current)',
+                color: i === lastGapIndex ? 'text-yellow' : isActive ? (i < lastGapIndex ? 'text-green' : 'text-red') : 'text-muted',
+                status: isActive ? 'ACTIVE' : (i === lastGapIndex ? '<-- YOU ARE HERE' : 'SHADOW (Inactive)')
             });
         }
 
         res.send(`
-            <!DOCTYPE html><html><head><title>Sniper AI Grid</title>
+            <!DOCTYPE html><html><head><title>Nano AI Grid</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0"><meta http-equiv="refresh" content="15">
             <style>
-                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; --yellow: #eab308; }
+                :root { --bg: #0b0f19; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #64748b; --green: #10b981; --red: #ef4444; --blue: #3b82f6; --purple: #a855f7; --yellow: #eab308; }
                 body { background: var(--bg); color: var(--text); font-family: sans-serif; padding: 15px; margin: 0; }
                 .container { max-width: 900px; margin: auto; }
                 .header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
@@ -324,22 +326,22 @@ app.get('/', async (req, res) => {
                 .stat-box { background: rgba(0,0,0,0.2); padding: 8px; border-radius: 8px; text-align: center; }
                 .label { font-size: 9px; color: var(--muted); text-transform: uppercase; }
                 .value { font-size: 14px; font-weight: 600; display: block; }
-                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); } .text-blue { color: var(--blue); }
+                .text-green { color: var(--green); } .text-red { color: var(--red); } .text-yellow { color: var(--yellow); } .text-purple { color: var(--purple); } .text-blue { color: var(--blue); } .text-muted { color: var(--muted); }
                 table { width: 100%; border-collapse: collapse; } th { text-align: left; font-size: 11px; color: var(--muted); padding: 8px; border-bottom: 1px solid var(--border); } td { padding: 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
                 .ai-box { padding: 12px; border-radius: 4px; font-size: 12px; margin-top: 10px; line-height: 1.6; border-left: 3px solid var(--purple); background: rgba(168, 85, 247, 0.05); }
-                .node-row { display: flex; justify-content: space-between; padding: 6px; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: monospace; }
+                .node-row { display: flex; justify-content: space-between; padding: 6px; border-bottom: 1px solid rgba(255,255,255,0.05); font-family: monospace; font-size:12px; }
             </style></head>
             <body><div class="container">
                 <div class="header-flex">
-                    <h2 style="color:var(--purple); margin:0;">AI GRID CO-PILOT</h2>
+                    <h2 style="color:var(--purple); margin:0;">NANO AI GRID</h2>
                     <span style="font-size: 10px; color: var(--muted);">Refresh: ${new Date().toLocaleTimeString()}</span>
                 </div>
 
                 <div class="grid" style="margin-bottom: 15px;">
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">BTC/USDT</div><div class="stat-value text-blue">$${currentPrice.toFixed(2)}</div></div>
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Daily Session PnL</div><div class="stat-value ${dailyPnL >= 0 ? 'text-green' : 'text-red'}">$${dailyPnL.toFixed(2)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time PnL</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(2)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Daily Session PnL</div><div class="stat-value ${dailyPnL >= 0 ? 'text-green' : 'text-red'}">$${dailyPnL.toFixed(4)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time PnL</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(4)}</div></div>
                 </div>
 
                 <div class="card">
@@ -349,7 +351,7 @@ app.get('/', async (req, res) => {
                         <div class="stat-box"><span class="label">Upper Bound</span><span class="value text-red">$${gridMax.toFixed(2)}</span></div>
                         <div class="stat-box"><span class="label">Total Nodes</span><span class="value">${gridLevelsCount}</span></div>
                         <div class="stat-box"><span class="label">Spacing</span><span class="value">$${gridSpacing.toFixed(2)}</span></div>
-                        <div class="stat-box"><span class="label">Allocated Risk</span><span class="value text-purple">${currentRiskPercent}%</span></div>
+                        <div class="stat-box"><span class="label">Active Window</span><span class="value text-purple">±${ACTIVE_WINDOW} Orders</span></div>
                         <div class="stat-box"><span class="label">Contracts per Node</span><span class="value">${gridQty}</span></div>
                     </div>
                     
@@ -359,11 +361,11 @@ app.get('/', async (req, res) => {
                 </div>
 
                 <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Live Grid Radar (Center Cross-Section)</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Shadow Grid Radar</h3>
                     <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px;">
-                        ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>$${n.price.toFixed(2)}</span></div>`).join('')}
+                        ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>$${n.price.toFixed(2)}</span><span class="${n.color}">${n.status}</span></div>`).join('')}
                     </div>
-                    <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">The bot auto-shifts nodes to capture profit as price crosses lines.</div>
+                    <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">To prevent margin exhaustion on $16 account, bot only places orders marked ACTIVE. Shadow levels are held in AI memory.</div>
                 </div>
 
                 <div class="card">
@@ -374,7 +376,7 @@ app.get('/', async (req, res) => {
                                 <td>${formatPHT(t.time)}</td>
                                 <td><span style="background:var(--blue); color:#fff; padding:2px 6px; border-radius:4px; font-size:10px;">${t.type}</span></td>
                                 <td>$${(t.price||0).toFixed(2)}</td>
-                                <td class="text-green">+$${(t.pnlUsd||0).toFixed(2)}</td>
+                                <td class="text-green">+$${(t.pnlUsd||0).toFixed(4)}</td>
                             </tr>`).join('')}
                         </table>
                     </div>
@@ -393,22 +395,21 @@ async function start() {
         const b = await mexc.fetchBalance(); 
         walletBalance = b.total['USDT'] || 0;
         
-        await sendNotification(`🚀 AI Grid Bot Online. Analyzing market...`);
+        await sendNotification(`🚀 Nano Grid AI Online. Safeguards active.`);
         
-        // Initial Grid Setup
         await buildDynamicGrid(); 
         
-        // Fast Stateless Tick (Heals Grid, Takes Profit, Replaces Nodes)
-        setInterval(reconcileGrid, 15000); // 15 Seconds
+        // Check grid every 15 seconds (Only fires API calls if order actually missing)
+        setInterval(reconcileGrid, 15000); 
         
-        // Balance Refresher
+        // Check balance quietly every minute
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e){} }, 60000);                          
         
-        // Daily AI Recalibration (Adapts to changing markets, avoids stagnation)
+        // Daily AI Recalibration
         setInterval(async () => {
-            dailyPnL = 0; // Reset daily tracker
+            dailyPnL = 0; 
             await buildDynamicGrid();
-        }, 86400000); // 24 Hours
+        }, 86400000); 
         
     } catch (e) { console.error(e); setTimeout(start, 10000); }
 }
