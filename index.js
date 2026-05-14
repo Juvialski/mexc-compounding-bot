@@ -65,11 +65,11 @@ let gridMin = 0;
 let gridMax = 0;
 let gridLevelsCount = 0;
 let gridSpacing = 0;
-let gridQty = 1; // Defaulting to 1 for nano accounts
+let gridQty = 1; 
 let gridNodes = []; 
 let lastGapIndex = -1;
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
-const ACTIVE_WINDOW = 3; // ONLY PLACE 3 ORDERS ABOVE AND 3 BELOW (Anti-Margin Exhaustion)
+const ACTIVE_WINDOW = 3; 
 
 const formatPHT = (dateInput) => {
     if (!dateInput) return 'N/A';
@@ -106,7 +106,7 @@ async function closeAllPositions() {
             const contracts = Number(pos.contracts || pos.info?.position || 0);
             await mexc.createMarketOrder(SYMBOL, side, contracts, undefined, { 'reduceOnly': true });
             console.log(`Closed existing ${pos.side} position of ${contracts} contracts to reset Grid.`);
-            await sleep(500); // Rate limit protection
+            await sleep(500); 
         }
     } catch(e) { console.error("Error closing positions:", e.message); }
 }
@@ -164,18 +164,19 @@ async function buildDynamicGrid() {
         await sleep(500);
         await closeAllPositions();
 
-        gridMin = aiDecision.lower_bound;
-        gridMax = aiDecision.upper_bound;
-        gridLevelsCount = aiDecision.grid_levels;
+        // FIX: Force these values to be strict Math Numbers just in case the AI returns them as strings
+        gridMin = Number(aiDecision.lower_bound);
+        gridMax = Number(aiDecision.upper_bound);
+        gridLevelsCount = Number(aiDecision.grid_levels);
         aiMacroRegime = aiDecision.reasoning;
 
         gridSpacing = (gridMax - gridMin) / gridLevelsCount;
         gridNodes = [];
+        
         for(let i = 0; i <= gridLevelsCount; i++) {
-            gridNodes.push({ price: parseFloat((gridMin + (i * gridSpacing)).toFixed(2)) });
+            gridNodes.push({ price: parseFloat((gridMin + (i * gridSpacing)).toFixed(1)) });
         }
 
-        // Lock Qty to minimum 1 for nano accounts, unless balance grows significantly
         let idealQty = Math.floor((walletBalance * 0.5 * LEVERAGE / gridLevelsCount) / (currentPrice * contractSize));
         gridQty = Math.max(1, idealQty); 
 
@@ -232,47 +233,65 @@ async function reconcileGrid() {
         }
         lastGapIndex = targetGapIndex;
 
-        // 3. Define the Active Window (Shadow Grid Optimization)
+        // 3. Define the Active Window
         const activeIndices = [];
         for(let i = Math.max(0, targetGapIndex - ACTIVE_WINDOW); i <= Math.min(gridNodes.length - 1, targetGapIndex + ACTIVE_WINDOW); i++) {
             if (i !== targetGapIndex) activeIndices.push(i);
         }
 
-        // 4. Fetch Book & Align Orders with Anti-Spam Delays
+        // 4. Fetch Book & Align Orders
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
         for (let o of openOrders) {
             let matchedIdx = -1;
             let mDiff = Infinity;
+            
             for(let i = 0; i < gridNodes.length; i++){
-                const d = Math.abs(gridNodes[i].price - o.price);
-                if(d < mDiff && d < (gridSpacing * 0.2)) { mDiff = d; matchedIdx = i; }
+                const d = Math.abs(gridNodes[i].price - Number(o.price));
+                if(d < mDiff) { mDiff = d; matchedIdx = i; }
             }
 
-            const expectedSide = matchedIdx < targetGapIndex ? 'buy' : 'sell';
+            if (mDiff > (gridSpacing * 0.45)) {
+                matchedIdx = -1;
+            }
 
-            // Cancel if out of active window, wrong side, or wrong size
-            if (!activeIndices.includes(matchedIdx) || o.side !== expectedSide || o.amount !== gridQty) {
-                try {
-                    await mexc.cancelOrder(o.id, SYMBOL);
-                    await sleep(200); // 200ms ANTI-SPAM THROTTLE
-                } catch(e) { }
+            if (matchedIdx !== -1) {
+                const expectedSide = matchedIdx < targetGapIndex ? 'buy' : 'sell';
+                const isSideMatch = o.side && o.side.toLowerCase() === expectedSide;
+                
+                const oAmt = Number(o.amount || o.info?.vol || 0);
+                const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
+
+                if (!activeIndices.includes(matchedIdx) || !isSideMatch || !isAmountMatch) {
+                    try {
+                        console.log(`Canceling order at $${o.price} - Shifting grid or cleaning mismatches.`);
+                        await mexc.cancelOrder(o.id, SYMBOL);
+                        await sleep(200); 
+                    } catch(e) { }
+                } else {
+                    ordersToKeep.push(matchedIdx);
+                }
             } else {
-                ordersToKeep.push(matchedIdx);
+                try {
+                    console.log(`Canceling stray order at $${o.price}`);
+                    await mexc.cancelOrder(o.id, SYMBOL);
+                    await sleep(200);
+                } catch(e) {}
             }
         }
 
-        // 5. Place Missing Orders within Active Window
+        // 5. Place Missing Orders
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
                 const desiredSide = i < targetGapIndex ? 'buy' : 'sell';
                 try {
                     await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
-                    await sleep(200); // 200ms ANTI-SPAM THROTTLE
+                    console.log(`Placed ${desiredSide} at $${gridNodes[i].price}`);
+                    await sleep(200); 
                 } catch(e) {
                     if (e.message.includes('balance') || e.message.includes('margin')) {
-                        console.error("Margin low, pausing order placement momentarily.");
+                        console.error(`Margin low, skipping order placement for $${gridNodes[i].price}`);
                         break; 
                     }
                 }
@@ -302,7 +321,6 @@ app.get('/', async (req, res) => {
         let endIdx = Math.min(gridNodes.length - 1, lastGapIndex + ACTIVE_WINDOW + 1);
         let visualNodes = [];
         
-        // FIX: Replaced targetGapIndex with lastGapIndex in the UI drawing loop
         for(let i = endIdx; i >= startIdx; i--) { 
             const isActive = i >= lastGapIndex - ACTIVE_WINDOW && i <= lastGapIndex + ACTIVE_WINDOW && i !== lastGapIndex;
             visualNodes.push({
@@ -367,7 +385,7 @@ app.get('/', async (req, res) => {
                     <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px;">
                         ${visualNodes.map(n => `<div class="node-row"><span class="${n.color}">${n.side}</span><span>$${n.price.toFixed(2)}</span><span class="${n.color}">${n.status}</span></div>`).join('')}
                     </div>
-                    <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">To prevent margin exhaustion on $16 account, bot only places orders marked ACTIVE. Shadow levels are held in AI memory.</div>
+                    <div style="margin-top:8px; font-size:10px; text-align:center; color:var(--muted);">To prevent margin exhaustion on account, bot only places orders marked ACTIVE. Shadow levels are held in AI memory.</div>
                 </div>
 
                 <div class="card">
@@ -401,13 +419,10 @@ async function start() {
         
         await buildDynamicGrid(); 
         
-        // Check grid every 15 seconds (Only fires API calls if order actually missing)
         setInterval(reconcileGrid, 15000); 
         
-        // Check balance quietly every minute
         setInterval(async () => { try { const b = await mexc.fetchBalance(); walletBalance = b.total['USDT'] || 0; } catch(e){} }, 60000);                          
         
-        // Daily AI Recalibration
         setInterval(async () => {
             dailyPnL = 0; 
             await buildDynamicGrid();
