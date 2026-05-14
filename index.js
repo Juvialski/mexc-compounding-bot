@@ -301,8 +301,10 @@ app.get('/', async (req, res) => {
         let startIdx = Math.max(0, lastGapIndex - ACTIVE_WINDOW - 1);
         let endIdx = Math.min(gridNodes.length - 1, lastGapIndex + ACTIVE_WINDOW + 1);
         let visualNodes = [];
+        
+        // FIX: Replaced targetGapIndex with lastGapIndex in the UI drawing loop
         for(let i = endIdx; i >= startIdx; i--) { 
-            const isActive = i >= targetGapIndex - ACTIVE_WINDOW && i <= targetGapIndex + ACTIVE_WINDOW && i !== lastGapIndex;
+            const isActive = i >= lastGapIndex - ACTIVE_WINDOW && i <= lastGapIndex + ACTIVE_WINDOW && i !== lastGapIndex;
             visualNodes.push({
                 price: gridNodes[i].price,
                 side: i < lastGapIndex ? 'BUY' : i > lastGapIndex ? 'SELL' : 'GAP (Current)',
