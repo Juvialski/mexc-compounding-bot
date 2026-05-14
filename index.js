@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - ROCK SOLID STATE
+// DYNAMIC AI GRID EDITION - ROCK SOLID STATE V2
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -205,7 +205,7 @@ async function reconcileGrid() {
             return;
         }
 
-        // 1. Find the highest node below current price
+        // 1. Find highest node below current price
         let currentLowerNodeIdx = -1;
         for (let i = 0; i < gridNodes.length; i++) {
             if (gridNodes[i].price < currentPrice) {
@@ -228,13 +228,13 @@ async function reconcileGrid() {
         // 3. Define Active Window
         const activeIndices = [];
         for(let i = currentLowerNodeIdx - ACTIVE_WINDOW + 1; i <= currentLowerNodeIdx; i++) {
-            if (i >= 0) activeIndices.push(i); // Buys below
+            if (i >= 0) activeIndices.push(i); 
         }
         for(let i = currentLowerNodeIdx + 1; i <= currentLowerNodeIdx + ACTIVE_WINDOW; i++) {
-            if (i < gridNodes.length) activeIndices.push(i); // Sells above
+            if (i < gridNodes.length) activeIndices.push(i); 
         }
 
-        // 4. Fetch Book & Align Orders (WITH DIAGNOSTICS)
+        // 4. Fetch Book & Align Orders (NO STRING MATCHING, PHYSICS ONLY)
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -252,20 +252,12 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
-                const expectedSide = matchedIdx <= currentLowerNodeIdx ? 'buy' : 'sell';
-                const actualSide = o.side ? o.side.toLowerCase() : expectedSide; // Fallback to expected if exchange data missing
-                const isSideMatch = (actualSide === expectedSide);
-                
-                // Extremely forgiving amount check to prevent CCXT data quirks from triggering cancels
+                // EXTREMELY FORGIVING AMOUNT CHECK
                 const oAmt = Number(o.amount || o.contracts || o.info?.vol || o.info?.v || o.info?.amount || gridQty);
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
                 if (!activeIndices.includes(matchedIdx)) {
                     console.log(`[CLEANUP] Canceling $${o.price}: Node shifted out of active window.`);
-                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
-                    await sleep(200); 
-                } else if (!isSideMatch) {
-                    console.log(`[CLEANUP] Canceling $${o.price}: Side mismatch. Expected ${expectedSide.toUpperCase()}`);
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else if (!isAmountMatch) {
@@ -277,7 +269,7 @@ async function reconcileGrid() {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else {
-                    // This is a perfect order, leave it on the exchange book.
+                    // Physics guarantee: If it is on the book at a valid grid price, it is correct.
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
@@ -290,7 +282,6 @@ async function reconcileGrid() {
         // 5. Place Missing Orders
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
-                // Buffer check: if price is resting right on the order line, wait so we don't trigger taker fees
                 const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
                 if (distanceToPrice < (gridSpacing * 0.10)) {
                     console.log(`[PAUSE] Price is hovering right on node $${gridNodes[i].price}. Delaying placement to protect maker fees.`);
