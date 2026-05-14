@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - THE "DEAD ZONE" FIX
+// DYNAMIC AI GRID EDITION - ROCK SOLID FINAL (NO SPAM)
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -67,7 +67,7 @@ let gridLevelsCount = 0;
 let gridSpacing = 0;
 let gridQty = 1; 
 let gridNodes = []; 
-let currentGapIdx = -1; // THE DEAD ZONE
+let currentGapIdx = -1; 
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
 const ACTIVE_WINDOW = 3; 
 
@@ -181,7 +181,6 @@ async function buildDynamicGrid() {
         let idealQty = Math.floor((walletBalance * 0.5 * LEVERAGE / gridLevelsCount) / (currentPrice * contractSize));
         gridQty = Math.max(1, idealQty); 
 
-        // INITIALIZE THE DEAD ZONE TO THE CLOSEST NODE
         let minDiff = Infinity;
         currentGapIdx = -1;
         for (let i = 0; i < gridNodes.length; i++) {
@@ -220,29 +219,26 @@ async function reconcileGrid() {
             return;
         }
 
-        // 1. STRICT DEAD ZONE SHIFTING (PHYSICS SECURED)
-        // Only shift the dead zone if the price physically crosses the active order lines
+        // 1. DEAD ZONE SHIFTING
         while (currentGapIdx > 0 && currentPrice <= gridNodes[currentGapIdx - 1].price) {
             currentGapIdx--;
-            console.log(`📉 Price crossed DOWN. Buy filled at $${gridNodes[currentGapIdx].price}. Grid shifted down.`);
+            console.log(`📉 Price crossed DOWN. Grid shifted down.`);
         }
         while (currentGapIdx < gridNodes.length - 1 && currentPrice >= gridNodes[currentGapIdx + 1].price) {
             currentGapIdx++;
-            console.log(`📈 Price crossed UP. Sell filled at $${gridNodes[currentGapIdx].price}. Grid shifted up.`);
+            console.log(`📈 Price crossed UP. Grid shifted up.`);
         }
 
-        // 2. DEFINE ACTIVE WINDOW (SKIPPING THE DEAD ZONE)
+        // 2. DEFINE ACTIVE WINDOW
         const activeIndices = [];
-        // Buys below the dead zone
         for(let i = currentGapIdx - 1; i >= Math.max(0, currentGapIdx - ACTIVE_WINDOW); i--) {
             activeIndices.push(i);
         }
-        // Sells above the dead zone
         for(let i = currentGapIdx + 1; i <= Math.min(gridNodes.length - 1, currentGapIdx + ACTIVE_WINDOW); i++) {
             activeIndices.push(i);
         }
 
-        // 3. FETCH BOOK & ALIGN ORDERS
+        // 3. FETCH BOOK & ALIGN ORDERS (NO SPAM, PURE PRICE MATCHING)
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -260,26 +256,22 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
-                const expectedSide = matchedIdx < currentGapIdx ? 'buy' : 'sell';
-                const actualSide = o.side ? o.side.toLowerCase() : expectedSide;
-                const isSideMatch = (actualSide === expectedSide);
-
-                const oAmt = Number(o.amount || o.contracts || o.info?.vol || o.info?.v || o.info?.amount || gridQty);
-                const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
-
+                // If it's outside our active window, cancel it.
                 if (!activeIndices.includes(matchedIdx)) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
-                } else if (!isAmountMatch || !isSideMatch) {
+                } 
+                // If we already have an order for this exact grid line, cancel the duplicate.
+                else if (ordersToKeep.includes(matchedIdx)) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
-                } else if (ordersToKeep.includes(matchedIdx)) {
-                    await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
-                    await sleep(200); 
-                } else {
+                } 
+                // PERFECT MATCH. NO CHECKING AMOUNTS. NO CHECKING STRINGS. LEAVE IT ALONE.
+                else {
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
+                // Stray order nowhere near our grid lines.
                 await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                 await sleep(200);
             }
@@ -456,10 +448,8 @@ async function start() {
         
         await buildDynamicGrid(); 
         
-        // 1. Core Order Management
         setInterval(reconcileGrid, 15000); 
         
-        // 2. EXACT Wallet Balance Tracker (Checks every 30 seconds for physical USDT changes)
         setInterval(async () => { 
             try { 
                 const bal = await mexc.fetchBalance(); 
@@ -467,21 +457,18 @@ async function start() {
                 
                 if (newBal > 0) {
                     const diff = newBal - walletBalance;
-                    // If balance changed by more than $0.0001 (filters out micro dust)
                     if (Math.abs(diff) > 0.0001) {
                         await Trade.create({ 
                             type: 'Wallet Settlement', 
                             price: currentPrice, 
                             pnlUsd: diff 
                         });
-                        console.log(`[BALANCE UPDATE] Wallet changed by $${diff.toFixed(4)}. New Balance: $${newBal.toFixed(4)}`);
                     }
                     walletBalance = newBal;
                 }
             } catch(e){} 
         }, 30000);                          
         
-        // 3. Daily AI Recalibration
         setInterval(async () => {
             const currentBal = await mexc.fetchBalance().then(b => b.total['USDT'] || walletBalance);
             await BotState.updateOne({ key: 'main' }, { $set: { dailyStartBalance: currentBal, lastReset: new Date() } });
