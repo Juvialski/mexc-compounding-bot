@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - ROCK SOLID STATE V2
+// DYNAMIC AI GRID EDITION - ROCK SOLID STATE V3 (FEE ACCURATE)
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -46,6 +46,8 @@ async function askAIWithRetry(prompt, maxRetries = 3, baseDelayMs = 5000) {
 // ==========================================
 const SYMBOL = 'BTC/USDT:USDT';
 const LEVERAGE = 10;
+const FEE_RATE = 0.0004; // 0.04% fee per order based on MEXC history
+
 const mexc = new ccxt.mexc({
     apiKey: process.env.API_KEY,
     secret: process.env.API_SECRET,
@@ -135,8 +137,10 @@ async function buildDynamicGrid() {
         CRITICAL: The user has an extremely low balance ($${walletBalance.toFixed(2)}). 
         Current Price: $${currentPrice}
         14-Day ATR: $${atr14}
+        Exchange Fees: The user pays a 0.08% round-trip fee on every grid trade.
 
-        Define a safe daily grid. Since balance is low, keep the grid relatively tight around the current price so the bot can capture smaller chops without requiring massive margin to span a huge range.
+        Define a safe daily grid. Since balance is low, keep the grid relatively tight. 
+        HOWEVER, you MUST ensure that the grid spacing is wide enough so that the gross profit per level comfortably outpaces the 0.08% round trip fee.
         
         Provide:
         - lower_bound: price for the bottom grid line
@@ -213,15 +217,21 @@ async function reconcileGrid() {
             } else { break; } 
         }
 
-        // 2. Detect Line Crossing (Profit Capture)
+        // 2. Detect Line Crossing (ACCURATE NET PROFIT CAPTURE)
         if (lastLowerNodeIdx !== -1 && currentLowerNodeIdx !== lastLowerNodeIdx) {
             const crossed = Math.abs(currentLowerNodeIdx - lastLowerNodeIdx);
-            const profitPerNode = gridSpacing * gridQty * contractSize;
-            const realizedPnL = crossed * profitPerNode;
+            
+            const grossProfitPerNode = gridSpacing * gridQty * contractSize;
+            const positionValueUsd = currentPrice * gridQty * contractSize;
+            const roundTripFee = positionValueUsd * FEE_RATE * 2; // Buy Fee + Sell Fee
+            
+            const netProfitPerNode = grossProfitPerNode - roundTripFee;
+            const realizedPnL = crossed * netProfitPerNode;
+            
             dailyPnL += realizedPnL;
             
             await Trade.create({ type: 'Grid Fill', price: currentPrice, pnlUsd: realizedPnL });
-            console.log(`✅ Grid Line Crossed! Shifted ${crossed} node(s). Approx PnL: $${realizedPnL.toFixed(4)}`);
+            console.log(`✅ Grid Line Crossed! Shifted ${crossed} node(s). Gross: $${(crossed*grossProfitPerNode).toFixed(4)} | Fees: -$${(crossed*roundTripFee).toFixed(4)} | Net: $${realizedPnL.toFixed(4)}`);
         }
         lastLowerNodeIdx = currentLowerNodeIdx;
 
@@ -234,7 +244,7 @@ async function reconcileGrid() {
             if (i < gridNodes.length) activeIndices.push(i); 
         }
 
-        // 4. Fetch Book & Align Orders (NO STRING MATCHING, PHYSICS ONLY)
+        // 4. Fetch Book & Align Orders
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -252,7 +262,6 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
-                // EXTREMELY FORGIVING AMOUNT CHECK
                 const oAmt = Number(o.amount || o.contracts || o.info?.vol || o.info?.v || o.info?.amount || gridQty);
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
@@ -269,7 +278,6 @@ async function reconcileGrid() {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else {
-                    // Physics guarantee: If it is on the book at a valid grid price, it is correct.
                     ordersToKeep.push(matchedIdx);
                 }
             } else {
@@ -312,7 +320,7 @@ async function reconcileGrid() {
 // ==========================================
 // ROUTES & DASHBOARD UI
 // ==========================================
-app.get('/reset-db', async (req, res) => { try { await Trade.deleteMany({}); res.send(`<h2>DB Cleared</h2>`); } catch(e){ res.send(e.message); } });
+app.get('/reset-db', async (req, res) => { try { await Trade.deleteMany({}); dailyPnL = 0; res.send(`<h2>DB Cleared. All PnL reset to $0.</h2>`); } catch(e){ res.send(e.message); } });
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
@@ -372,8 +380,8 @@ app.get('/', async (req, res) => {
                 <div class="grid" style="margin-bottom: 15px;">
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">BTC/USDT</div><div class="stat-value text-blue">$${currentPrice.toFixed(2)}</div></div>
                     <div class="card" style="margin-bottom: 0;"><div class="stat-title">Wallet</div><div class="stat-value">$${Number(walletBalance || 0).toFixed(2)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Daily Session PnL</div><div class="stat-value ${dailyPnL >= 0 ? 'text-green' : 'text-red'}">$${dailyPnL.toFixed(4)}</div></div>
-                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time PnL</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(4)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">Daily Session Net PnL</div><div class="stat-value ${dailyPnL >= 0 ? 'text-green' : 'text-red'}">$${dailyPnL.toFixed(4)}</div></div>
+                    <div class="card" style="margin-bottom: 0;"><div class="stat-title">All-Time Net PnL</div><div class="stat-value ${totalPnl >= 0 ? 'text-green' : 'text-red'}">$${totalPnl.toFixed(4)}</div></div>
                 </div>
 
                 <div class="card">
@@ -401,9 +409,9 @@ app.get('/', async (req, res) => {
                 </div>
 
                 <div class="card">
-                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Recent Grid Fills</h3>
+                    <h3 style="margin: 0 0 10px 0; font-size: 14px; color:var(--muted);">Recent True Net PnL Fills</h3>
                     <div style="overflow-x:auto;">
-                        <table><tr><th>Time</th><th>Event</th><th>Price Crossed</th><th>PnL USD</th></tr>
+                        <table><tr><th>Time</th><th>Event</th><th>Price Crossed</th><th>Net PnL (After Fees)</th></tr>
                         ${allTrades.map(t => `<tr>
                                 <td>${formatPHT(t.time)}</td>
                                 <td><span style="background:var(--blue); color:#fff; padding:2px 6px; border-radius:4px; font-size:10px;">${t.type}</span></td>
