@@ -1,5 +1,5 @@
 // ==========================================
-// DYNAMIC AI GRID EDITION - EXACT WALLET PNL TRACKING
+// DYNAMIC AI GRID EDITION - THE "DEAD ZONE" FIX
 // ==========================================
 require('dotenv').config();
 const ccxt = require('ccxt');
@@ -67,7 +67,7 @@ let gridLevelsCount = 0;
 let gridSpacing = 0;
 let gridQty = 1; 
 let gridNodes = []; 
-let lastLowerNodeIdx = -1;
+let currentGapIdx = -1; // THE DEAD ZONE
 let aiMacroRegime = "Awaiting first AI Grid analysis...";
 const ACTIVE_WINDOW = 3; 
 
@@ -181,7 +181,14 @@ async function buildDynamicGrid() {
         let idealQty = Math.floor((walletBalance * 0.5 * LEVERAGE / gridLevelsCount) / (currentPrice * contractSize));
         gridQty = Math.max(1, idealQty); 
 
-        lastLowerNodeIdx = -1; 
+        // INITIALIZE THE DEAD ZONE TO THE CLOSEST NODE
+        let minDiff = Infinity;
+        currentGapIdx = -1;
+        for (let i = 0; i < gridNodes.length; i++) {
+            let diff = Math.abs(gridNodes[i].price - currentPrice);
+            if (diff < minDiff) { minDiff = diff; currentGapIdx = i; }
+        }
+
         gridActive = true;
         
         console.log(`[GRID BUILT] Bounds: ${gridMin} to ${gridMax} | Nodes: ${gridLevelsCount} | Spacing: $${gridSpacing.toFixed(2)}`);
@@ -197,7 +204,7 @@ async function buildDynamicGrid() {
 // SHADOW GRID RECONCILIATION LOOP
 // ==========================================
 async function reconcileGrid() {
-    if (isReconciling || !gridActive) return;
+    if (isReconciling || !gridActive || currentGapIdx === -1) return;
     isReconciling = true;
     
     try {
@@ -213,24 +220,29 @@ async function reconcileGrid() {
             return;
         }
 
-        let currentLowerNodeIdx = -1;
-        for (let i = 0; i < gridNodes.length; i++) {
-            if (gridNodes[i].price < currentPrice) {
-                currentLowerNodeIdx = i; 
-            } else { break; } 
+        // 1. STRICT DEAD ZONE SHIFTING (PHYSICS SECURED)
+        // Only shift the dead zone if the price physically crosses the active order lines
+        while (currentGapIdx > 0 && currentPrice <= gridNodes[currentGapIdx - 1].price) {
+            currentGapIdx--;
+            console.log(`📉 Price crossed DOWN. Buy filled at $${gridNodes[currentGapIdx].price}. Grid shifted down.`);
+        }
+        while (currentGapIdx < gridNodes.length - 1 && currentPrice >= gridNodes[currentGapIdx + 1].price) {
+            currentGapIdx++;
+            console.log(`📈 Price crossed UP. Sell filled at $${gridNodes[currentGapIdx].price}. Grid shifted up.`);
         }
 
-        // PnL Calculation removed from here! Handled purely by the Wallet Tracking interval now.
-        lastLowerNodeIdx = currentLowerNodeIdx;
-
+        // 2. DEFINE ACTIVE WINDOW (SKIPPING THE DEAD ZONE)
         const activeIndices = [];
-        for(let i = currentLowerNodeIdx - ACTIVE_WINDOW + 1; i <= currentLowerNodeIdx; i++) {
-            if (i >= 0) activeIndices.push(i); 
+        // Buys below the dead zone
+        for(let i = currentGapIdx - 1; i >= Math.max(0, currentGapIdx - ACTIVE_WINDOW); i--) {
+            activeIndices.push(i);
         }
-        for(let i = currentLowerNodeIdx + 1; i <= currentLowerNodeIdx + ACTIVE_WINDOW; i++) {
-            if (i < gridNodes.length) activeIndices.push(i); 
+        // Sells above the dead zone
+        for(let i = currentGapIdx + 1; i <= Math.min(gridNodes.length - 1, currentGapIdx + ACTIVE_WINDOW); i++) {
+            activeIndices.push(i);
         }
 
+        // 3. FETCH BOOK & ALIGN ORDERS
         const openOrders = await mexc.fetchOpenOrders(SYMBOL);
         const ordersToKeep = [];
 
@@ -248,13 +260,17 @@ async function reconcileGrid() {
             }
 
             if (matchedIdx !== -1) {
+                const expectedSide = matchedIdx < currentGapIdx ? 'buy' : 'sell';
+                const actualSide = o.side ? o.side.toLowerCase() : expectedSide;
+                const isSideMatch = (actualSide === expectedSide);
+
                 const oAmt = Number(o.amount || o.contracts || o.info?.vol || o.info?.v || o.info?.amount || gridQty);
                 const isAmountMatch = Math.abs(oAmt - gridQty) < 0.1;
 
                 if (!activeIndices.includes(matchedIdx)) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
-                } else if (!isAmountMatch) {
+                } else if (!isAmountMatch || !isSideMatch) {
                     await mexc.cancelOrder(o.id, SYMBOL).catch(()=>{});
                     await sleep(200); 
                 } else if (ordersToKeep.includes(matchedIdx)) {
@@ -269,18 +285,21 @@ async function reconcileGrid() {
             }
         }
 
+        // 4. PLACE MISSING ORDERS
         for (let i of activeIndices) {
             if (!ordersToKeep.includes(i)) {
                 const distanceToPrice = Math.abs(gridNodes[i].price - currentPrice);
-                if (distanceToPrice < (gridSpacing * 0.10)) {
-                    continue;
+                if (distanceToPrice < (gridSpacing * 0.05)) {
+                    continue; // Maker fee protection
                 }
 
-                const desiredSide = i <= currentLowerNodeIdx ? 'buy' : 'sell';
+                const desiredSide = i < currentGapIdx ? 'buy' : 'sell';
                 try {
                     await mexc.createLimitOrder(SYMBOL, desiredSide, gridQty, gridNodes[i].price);
                     await sleep(200); 
-                } catch(e) { break; }
+                } catch(e) {
+                    if (e.message.includes('balance') || e.message.includes('margin')) break; 
+                }
             }
         }
 
@@ -310,7 +329,7 @@ app.get('/reset-db', async (req, res) => {
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
 app.get('/', async (req, res) => {
-    if (dbStatus !== "Connected" || gridNodes.length === 0) return res.send(`<h2>AI Grid Initializing... (Fetching AI Data)</h2>`);
+    if (dbStatus !== "Connected" || gridNodes.length === 0 || currentGapIdx === -1) return res.send(`<h2>AI Grid Initializing... (Fetching AI Data)</h2>`);
     try {
         const allTrades = await Trade.find().sort({ time: -1 }).limit(12).lean();
         const state = await BotState.findOne({ key: 'main' });
@@ -322,26 +341,26 @@ app.get('/', async (req, res) => {
             dailyPnL = walletBalance - state.dailyStartBalance;
         }
 
-        let startIdx = Math.max(0, lastLowerNodeIdx - ACTIVE_WINDOW - 1);
-        let endIdx = Math.min(gridNodes.length - 1, lastLowerNodeIdx + ACTIVE_WINDOW + 2);
+        let startIdx = Math.max(0, currentGapIdx - ACTIVE_WINDOW - 1);
+        let endIdx = Math.min(gridNodes.length - 1, currentGapIdx + ACTIVE_WINDOW + 1);
         let visualNodes = [];
         
         for(let i = endIdx; i >= startIdx; i--) { 
-            const isExpectedBuy = i <= lastLowerNodeIdx;
-            const sideStr = isExpectedBuy ? 'BUY' : 'SELL';
-            
-            const isActive = isExpectedBuy 
-                ? (i >= lastLowerNodeIdx - ACTIVE_WINDOW + 1 && i <= lastLowerNodeIdx)
-                : (i >= lastLowerNodeIdx + 1 && i <= lastLowerNodeIdx + ACTIVE_WINDOW);
+            if (i === currentGapIdx) {
+                visualNodes.push({ price: gridNodes[i].price, side: 'GAP', color: 'text-yellow', status: '<-- DEAD ZONE' });
+            } else {
+                const isBuy = i < currentGapIdx;
+                const sideStr = isBuy ? 'BUY' : 'SELL';
                 
-            const color = isActive ? (isExpectedBuy ? 'text-green' : 'text-red') : 'text-muted';
-            const status = isActive ? 'ACTIVE' : 'SHADOW';
+                const isActive = isBuy 
+                    ? (i >= currentGapIdx - ACTIVE_WINDOW && i < currentGapIdx)
+                    : (i > currentGapIdx && i <= currentGapIdx + ACTIVE_WINDOW);
+                    
+                const color = isActive ? (isBuy ? 'text-green' : 'text-red') : 'text-muted';
+                const status = isActive ? 'ACTIVE' : 'SHADOW';
 
-            if (i === lastLowerNodeIdx) {
-                visualNodes.push({ price: currentPrice, side: 'GAP', color: 'text-yellow', status: '<-- CURRENT PRICE' });
+                visualNodes.push({ price: gridNodes[i].price, side: sideStr, color: color, status: status });
             }
-
-            visualNodes.push({ price: gridNodes[i].price, side: sideStr, color: color, status: status });
         }
 
         res.send(`
